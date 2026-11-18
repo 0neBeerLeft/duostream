@@ -1,0 +1,61 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "duostream",
+  "version": "0.5.0",
+  "identifier": "com.duostream.app",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "duostream",
+        "width": 1500,
+        "height": 920,
+        "minWidth": 960,
+        "minHeight": 600,
+        "center": true,
+        "additionalBrowserArgs": "--autoplay-policy=no-user-gesture-required --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection",
+        "decorations": false,
+        "shadow": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQwQzE0QjJCNUE5OTY1QTkKUldTcFpabGFLMHZCMEk1azRxYVZYZ3RXZUY5dFVROVpmQXdLak5HYXp2MjNqNnJjdnV1UHI0RkgK",
+      "endpoints": [
+        "https://github.com/0neBeerLeft/duostream/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "publisher": "duostream",
+    "shortDescription": "Twitch and Kick in one fast desktop app",
+    "category": "Video",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}

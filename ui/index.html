@@ -1,0 +1,52 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>duostream</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <!-- sign-in gate -->
+  <div id="gate" class="gate hidden"></div>
+
+  <!-- app shell -->
+  <div id="shell" class="hidden">
+    <header class="navbar">
+      <div class="left">
+        <button class="icon-btn" id="sideToggle" title="Toggle sidebar"></button>
+        <a class="logo" href="#" id="logoLink"><svg class="mark" viewBox="0 0 314 215" aria-hidden="true"><g fill="currentColor" stroke="currentColor" stroke-width="20" stroke-linejoin="round"><polygon points="131.14,10 227.86,10 120.86,117 24.14,117"/><polygon points="193.14,98 289.86,98 182.86,205 86.14,205"/></g></svg><span class="word">duostream</span></a>
+        <a class="navlink" href="#" data-view="following">Following</a>
+        <a class="navlink" href="#" data-view="browse">Browse</a>
+        <a class="navlink" href="#" data-view="drops">Drops</a>
+      </div>
+      <form class="search" id="searchForm" autocomplete="off">
+        <input id="searchInput" placeholder="Search" spellcheck="false">
+        <button class="icon-btn" type="submit" id="searchBtn" title="Search"></button>
+        <div class="suggest hidden" id="suggest"></div>
+      </form>
+      <div class="right" id="navRight"></div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="main" id="main"></main>
+      <aside class="chat hidden" id="chat"></aside>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- custom window controls (the native title bar is turned off) -->
+  <div class="winbar" id="winbar">
+    <button class="wb" id="wbMin" title="Minimize" tabindex="-1"><svg viewBox="0 0 10 10"><path d="M0 5h10" /></svg></button>
+    <button class="wb" id="wbMax" title="Maximize" tabindex="-1"><svg viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9" /></svg></button>
+    <button class="wb close" id="wbClose" title="Close" tabindex="-1"><svg viewBox="0 0 10 10"><path d="M0 0l10 10M10 0 0 10" /></svg></button>
+  </div>
+
+  <script src="hls.min.js"></script>
+  <script src="enhancer.js"></script>
+  <script src="app.js"></script>
+  <script src="enhancer-ui.js"></script>
+</body>
+</html>

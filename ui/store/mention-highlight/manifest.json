@@ -1,0 +1,7 @@
+{
+  "id": "mention-highlight",
+  "name": "Mention Highlight",
+  "version": "1.0.0",
+  "author": "duostream",
+  "description": "Highlights chat messages that mention your Twitch or Kick name."
+}

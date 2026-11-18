@@ -1,0 +1,29 @@
+[package]
+name = "duostream"
+version = "0.5.0"
+edition = "2021"
+description = "Twitch + Kick desktop client (Tauri 2)"
+repository = "https://github.com/0neBeerLeft/duostream"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+tauri-plugin-updater = "2"
+ureq = { version = "2.10", features = ["json", "native-tls"] }
+native-tls = { version = "0.2", features = ["alpn"] }
+tungstenite = { version = "0.24", features = ["native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

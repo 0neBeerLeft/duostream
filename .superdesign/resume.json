@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "targets": {
+    "channel-page": {
+      "targetKind": "existing-ui",
+      "projectId": "5f16866c-6f2a-4673-99b5-fb9441ebc32c",
+      "baselineDraftId": "71ae7e69-a675-4b0e-9be9-6ffc8c683574",
+      "activeDraftId": "71ae7e69-a675-4b0e-9be9-6ffc8c683574",
+      "designSystemPath": ".superdesign/design-system.md",
+      "referenceIds": [
+        "ui-logo-mark.svg"
+      ],
+      "brandAssets": {
+        "logo": {
+          "assetKey": "ui-logo-mark.svg",
+          "url": "https://vgbujcuwptvheqijyjbe.supabase.co/storage/v1/object/public/hmac-uploads/projects/5f16866c-6f2a-4673-99b5-fb9441ebc32c/brand-assets/ui-logo-mark.svg/duostream-mark.svg",
+          "sourcePath": "ui/index.html"
+        }
+      },
+      "contextFiles": [
+        ".superdesign/design-system.md",
+        "ui/index.html",
+        "ui/app.css",
+        "ui/app.js:22:75",
+        "ui/app.js:297:330",
+        "ui/app.js:472:530",
+        "ui/app.js:1142:1500",
+        "ui/app.js:1494:1600",
+        "ui/app.js:1707:1720"
+      ],
+      "fingerprints": {
+        ".superdesign/design-system.md": "520d3c51a21ad4986a63613bce6a31eaba12cb8f80ff5693522c47e9b26ebed5",
+        "ui/index.html": "426e7b55cf6424e50ad407e4fa7fcb6aa7b71cd29898c98cb798717e99c036a8",
+        "ui/app.css": "877d0804ba0b56d5248474c208f084de26c0c9afcf7f3a4989bdaa7e93ff9158",
+        "ui/app.js": "91fe9fce7ff1278f7e63869a4e43fecca45d10298f51ffaa5d0010c3d8bc9a51"
+      },
+      "components": [],
+      "drafts": {
+        "71ae7e69-a675-4b0e-9be9-6ffc8c683574": {
+          "title": "Current channel page (reproduction)",
+          "visualDirection": "current Kick-style baseline",
+          "currentVersion": 2
+        },
+        "10c2e846-9d78-4e2e-b20b-eeac59506638": {
+          "title": "Cinematic (A) #1",
+          "visualDirection": "cinematic, player-first, glass controls",
+          "parentDraftId": "71ae7e69-a675-4b0e-9be9-6ffc8c683574",
+          "currentVersion": 1
+        },
+        "1e0089fe-6985-4d3b-b910-52731753ec60": {
+          "title": "Cinematic (A) #2",
+          "visualDirection": "cinematic, player-first, glass controls",
+          "parentDraftId": "71ae7e69-a675-4b0e-9be9-6ffc8c683574",
+          "currentVersion": 1
+        },
+        "ab70cb0e-e072-438f-a616-299c1695daee": {
+          "title": "Cinematic Channel Page",
+          "visualDirection": "cinematic",
+          "parentDraftId": "71ae7e69-a675-4b0e-9be9-6ffc8c683574",
+          "currentVersion": 1
+        },
+        "21205f37-ca85-4277-bafd-a09243da09f8": {
+          "title": "Duo Control Room (B)",
+          "visualDirection": "dense pro tool, dual Twitch/Kick accent",
+          "parentDraftId": "71ae7e69-a675-4b0e-9be9-6ffc8c683574",
+          "currentVersion": 1
+        }
+      },
+      "updatedAt": "2026-11-17T21:32:17.654Z"
+    }
+  }
+}

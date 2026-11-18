@@ -1,0 +1,42 @@
+{
+  "name": "duostream plugins",
+  "plugins": [
+    {
+      "id": "adblock",
+      "name": "Ad Block",
+      "version": "1.0.0",
+      "author": "duostream",
+      "description": "Removes Twitch ads from streams and switches to an ad-free feed during ad breaks.",
+      "builtin": true,
+      "manifest": "adblock/manifest.json",
+      "code": "adblock/plugin.js"
+    },
+    {
+      "id": "chat-timestamps",
+      "name": "Chat Timestamps",
+      "version": "1.0.0",
+      "author": "duostream",
+      "description": "Shows the time next to every chat message.",
+      "manifest": "chat-timestamps/manifest.json",
+      "code": "chat-timestamps/plugin.js"
+    },
+    {
+      "id": "hide-bots",
+      "name": "Hide Chat Bots",
+      "version": "1.0.0",
+      "author": "duostream",
+      "description": "Hides messages from Nightbot, StreamElements, Moobot, Fossabot, BotRix and other common bots.",
+      "manifest": "hide-bots/manifest.json",
+      "code": "hide-bots/plugin.js"
+    },
+    {
+      "id": "mention-highlight",
+      "name": "Mention Highlight",
+      "version": "1.0.0",
+      "author": "duostream",
+      "description": "Highlights chat messages that mention your Twitch or Kick name.",
+      "manifest": "mention-highlight/manifest.json",
+      "code": "mention-highlight/plugin.js"
+    }
+  ]
+}

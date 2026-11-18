@@ -1,0 +1,7 @@
+{
+  "id": "chat-timestamps",
+  "name": "Chat Timestamps",
+  "version": "1.0.0",
+  "author": "duostream",
+  "description": "Shows the time next to every chat message."
+}

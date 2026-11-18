@@ -1,0 +1,7 @@
+{
+  "id": "hide-bots",
+  "name": "Hide Chat Bots",
+  "version": "1.0.0",
+  "author": "duostream",
+  "description": "Hides messages from Nightbot, StreamElements, Moobot, Fossabot, BotRix and other common bots."
+}

@@ -1,0 +1,8 @@
+{
+  "id": "adblock",
+  "name": "Ad Block",
+  "version": "1.0.0",
+  "author": "duostream",
+  "description": "Removes Twitch ads from streams and switches to an ad-free feed during ad breaks.",
+  "builtin": true
+}
