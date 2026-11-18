@@ -27,7 +27,7 @@ const CE = (() => {
       rules: [], // { id, enabled, type: "words"|"regex"|"user", value, platform: "any"|"Twitch"|"Kick", label }
     },
     highlights: {
-      mention: { enabled: true, color: "", bg: "#53fc181f", sound: false, emph: true },
+      mention: { enabled: true, color: "", bg: "#2dd4bf1f", sound: false, emph: true },
       broadcaster: { enabled: false, color: "", bg: "#e5114714", sound: false, emph: false },
       mod: { enabled: false, color: "", bg: "#00a3ff14", sound: false, emph: false },
       vip: { enabled: false, color: "", bg: "#ffb80014", sound: false, emph: false },
@@ -289,6 +289,12 @@ const CE = (() => {
       const saved = await window.__TAURI__.core.invoke("ce_load");
       cfg = merge(DEFAULTS, saved && typeof saved === "object" ? saved : {});
     } catch { cfg = clone(DEFAULTS); }
+    // brand color moved from Kick green to mint teal: migrate highlight colors saved with the old defaults
+    const recolor = (v) => (typeof v === "string" && v.toLowerCase().startsWith("#53fc18") ? "#2dd4bf" + v.slice(7) : v);
+    for (const h of [...Object.values(cfg.highlights).filter((x) => x && !Array.isArray(x) && typeof x === "object"), ...cfg.highlights.rules]) {
+      h.bg = recolor(h.bg);
+      h.color = recolor(h.color);
+    }
     compile();
     applyAppearance();
     return cfg;

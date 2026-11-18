@@ -1620,13 +1620,31 @@ async fn update_check(app: AppHandle) -> Result<Option<serde_json::Value>, Strin
     Ok(u.map(|u| json!({ "version": u.version, "notes": u.body })))
 }
 
-/// Download + install the update, then restart.
+/// Download + install the update (reporting `update-progress` events), then restart.
 #[tauri::command]
 async fn update_install(app: AppHandle) -> Result<(), String> {
     use tauri_plugin_updater::UpdaterExt;
     let Some(u) = app.updater().map_err(|e| e.to_string())?.check().await.map_err(|e| e.to_string())? else { return Ok(()) };
-    u.download_and_install(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+    let (a1, a2) = (app.clone(), app.clone());
+    let mut done: u64 = 0;
+    u.download_and_install(
+        move |chunk, total| {
+            done += chunk as u64;
+            let _ = a1.emit("update-progress", json!({ "done": done, "total": total }));
+        },
+        move || {
+            let _ = a2.emit("update-progress", json!({ "installing": true }));
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     app.restart();
+}
+
+/// Installed version (from tauri.conf.json).
+#[tauri::command]
+fn app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
 }
 
 /// Windows labels toasts by AppUserModelID. Register ours (name + icon) so notifications say
@@ -1738,6 +1756,7 @@ fn main() {
             notify_desktop,
             update_check,
             update_install,
+            app_version,
             search_all,
             browse_page,
             save_clip,

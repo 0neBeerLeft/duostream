@@ -27,7 +27,7 @@ const ceRange = (path, label, min, max, step = 1, unit = "") => `<div class="ce-
 const ceSelect = (path, label, opts, hint = "") => `<div class="ce-row"><div><b>${label}</b>${hint ? `<p>${hint}</p>` : ""}</div><select class="ce-sel" data-ce="${path}">${opts.map(([v, l]) => `<option value="${esc(v)}" ${String(ceGet(path)) === String(v) ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></div>`;
 const ceColor = (path, title) => {
   const v = ceGet(path) || "";
-  return `<span class="ce-swatch ${v ? "" : "empty"}" title="${title}"><input type="color" value="${esc(v.slice(0, 7) || "#53fc18")}" data-ce="${path}" data-color><button class="ce-swatch-x" data-ceclear="${path}" title="Clear">${I.close}</button></span>`;
+  return `<span class="ce-swatch ${v ? "" : "empty"}" title="${title}"><input type="color" value="${esc(v.slice(0, 7) || "#2dd4bf")}" data-ce="${path}" data-color><button class="ce-swatch-x" data-ceclear="${path}" title="Clear">${I.close}</button></span>`;
 };
 const platSel = (attr, val) => `<select class="ce-sel sm" ${attr}>${[["any", "Both platforms"], ["Twitch", "Twitch only"], ["Kick", "Kick only"]].map(([v, l]) => `<option value="${v}" ${val === v ? "selected" : ""}>${l}</option>`).join("")}</select>`;
 const typeSel = (attr, val, opts) => `<select class="ce-sel sm" ${attr}>${opts.map(([v, l]) => `<option value="${v}" ${val === v ? "selected" : ""}>${l}</option>`).join("")}</select>`;
@@ -159,7 +159,7 @@ function ceRunTest() {
 function renderCePreview() {
   const box = $("#cePreview"); if (!box) return;
   const platform = S.ch?.platform || (S.st.kick && !S.st.twitch ? "Kick" : "Twitch");
-  const me = myName(platform) || "you";
+  const me = "you"; // generic in the preview (never shows your real account name)
   const kappa = "https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/1.0";
   const samples = [
     { name: "StreamerName", color: "#ff6b8a", badges: ["broadcaster/1"], spans: [{ t: "text", v: "Welcome in everyone! " }, { t: "emote", v: kappa }] },
@@ -223,7 +223,7 @@ document.addEventListener("click", (e) => {
   if (!act) return;
   const a = act.dataset.ceact;
   if (a === "addFilter") CE.update((c) => c.filters.rules.push({ id: CE.newId(), enabled: true, type: "words", value: "", platform: "any", label: "" }));
-  else if (a === "addHl") CE.update((c) => c.highlights.rules.push({ id: CE.newId(), enabled: true, type: "words", value: "", platform: "any", color: "", bg: "#53fc1826", sound: false, emph: true, label: "" }));
+  else if (a === "addHl") CE.update((c) => c.highlights.rules.push({ id: CE.newId(), enabled: true, type: "words", value: "", platform: "any", color: "", bg: "#2dd4bf26", sound: false, emph: true, label: "" }));
   else if (a === "testSound") { CE.beep(true); return; }
   else if (a === "resetAll" || a.startsWith("reset|")) {
     const key = a === "resetAll" ? "all" : a.split("|")[1];

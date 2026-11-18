@@ -3,7 +3,7 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const appWindow = window.__TAURI__.window.getCurrentWindow();
-const APP_VERSION = "0.5.0";
+const APP_VERSION = "0.6.0";
 window.addEventListener("error", (e) => invoke("js_log", { msg: `${new Date().toISOString()} ${e.message} @ ${e.filename}:${e.lineno}:${e.colno}` }).catch(() => {}));
 window.addEventListener("unhandledrejection", (e) => invoke("js_log", { msg: `${new Date().toISOString()} unhandled: ${e.reason?.stack || e.reason}` }).catch(() => {}));
 
@@ -662,6 +662,7 @@ function renderMain() {
       <div class="section-title" style="font-size:16px">Accounts</div>
       ${providersHTML()}
       <div class="section-title" style="font-size:16px;margin-top:28px">App</div>
+      ${updateRowHTML()}
       <div class="setting"><div><b>Go-live notifications</b><p>Get a Windows notification when a channel you follow goes live.</p></div><button class="switch ${S.st.notify_live ? "on" : ""}" data-pref="notifyLive"></button></div>
       <div class="setting"><div><b>Keep running in the tray</b><p>Closing the window keeps duostream in the system tray so notifications keep working.</p></div><button class="switch ${S.st.close_to_tray ? "on" : ""}" data-pref="closeToTray"></button></div>
       <div class="setting"><div><b>Auto-claim rewards</b><p>Claim channel point bonuses and finished drops automatically.</p></div><button class="switch ${S.st.auto_claim ? "on" : ""}" data-pref="autoClaim"></button></div>
@@ -1929,7 +1930,7 @@ function togglePointsMenu() {
   pop.innerHTML = `<div class="pts-menu">
     <div class="pts-head">${p.icon ? `<img src="${esc(p.icon)}" alt="">` : I.points}<b>${fmt(p.balance || 0)}</b><span>${esc(p.name)}</span></div>
     <p class="hint">Points build up while you watch here.${S.st.auto_claim ? " Bonus chests are claimed for you." : ""}</p>
-    <div class="pts-list">${(p.rewards || []).map((r, i) => `<button class="reward ${r.available && (p.balance || 0) >= r.cost ? "" : "dim"}" data-reward="${i}" style="--rc:${esc(r.color || "#53fc18")}">
+    <div class="pts-list">${(p.rewards || []).map((r, i) => `<button class="reward ${r.available && (p.balance || 0) >= r.cost ? "" : "dim"}" data-reward="${i}" style="--rc:${esc(r.color || "#2dd4bf")}">
         <span class="ri">${r.image ? `<img src="${esc(r.image)}" alt="">` : I.gift}</span><span class="rt">${esc(r.title)}</span><span class="rc">${fmt(r.cost)}</span></button>`).join("") || '<div class="hint">This channel has no custom rewards.</div>'}</div>
   </div>`;
 }
@@ -2294,7 +2295,7 @@ function ceDialog(title, fields, { okLabel = "Save", extra = null } = {}) {
       <div class="ced-title">${esc(title)}</div>
       ${fields.map((f) => `<label class="ced-field"><span>${esc(f.label)}</span>${
         f.type === "textarea" ? `<textarea data-k="${f.key}" rows="4" maxlength="500" spellcheck="false">${esc(f.value || "")}</textarea>`
-        : f.type === "color" ? `<span class="ced-color"><input type="color" data-k="${f.key}" value="${esc(f.value || "#53fc18")}"><code>${esc(f.value || "#53fc18")}</code></span>`
+        : f.type === "color" ? `<span class="ced-color"><input type="color" data-k="${f.key}" value="${esc(f.value || "#2dd4bf")}"><code>${esc(f.value || "#2dd4bf")}</code></span>`
         : `<input data-k="${f.key}" value="${esc(f.value || "")}" spellcheck="false">`}</label>`).join("")}
       <div class="row-actions">${extra ? `<button class="btn secondary sm" data-ced="extra">${esc(extra)}</button><span class="grow"></span>` : ""}<button class="btn secondary sm" data-ced="cancel">Cancel</button><button class="btn primary sm" data-ced="ok">${esc(okLabel)}</button></div>
     </div></div>`);
@@ -2341,7 +2342,7 @@ function openMsgMenu(m, x, y) {
 }
 async function editUserColor(platform, login, name) {
   const cur = CE.user(platform, login)?.color || "";
-  const r = await ceDialog(`Name color for ${name} (${platform})`, [{ key: "color", label: "Color", type: "color", value: cur || "#53fc18" }], { extra: cur ? "Remove color" : null });
+  const r = await ceDialog(`Name color for ${name} (${platform})`, [{ key: "color", label: "Color", type: "color", value: cur || "#2dd4bf" }], { extra: cur ? "Remove color" : null });
   if (!r) return;
   CE.setUser(platform, login, { color: r.__extra ? "" : r.color }, name);
 }
@@ -2486,6 +2487,73 @@ function initWinbar() {
   });
 }
 
+// ------------------------------------------------------------------ updates (GitHub releases, signed)
+const Upd = { state: "idle", version: null, error: null, pct: 0, current: APP_VERSION };
+/** manual = from the Settings button (shows "up to date" / errors instead of staying quiet). */
+async function checkUpdate(manual) {
+  if (Upd.state === "downloading" || Upd.state === "installing") return;
+  Upd.state = "checking"; Upd.error = null; renderUpdateRow();
+  try {
+    const u = await invoke("update_check");
+    if (u) { Upd.state = "available"; Upd.version = u.version; showUpdateBar(); }
+    else { Upd.state = "uptodate"; Upd.version = null; }
+  } catch (e) {
+    Upd.state = manual ? "error" : "idle";
+    Upd.error = String(e);
+    invoke("js_log", { msg: `update check: ${e}` });
+  }
+  renderUpdateRow();
+}
+async function installUpdate() {
+  if (Upd.state === "downloading" || Upd.state === "installing") return;
+  Upd.state = "downloading"; Upd.pct = 0;
+  renderUpdateRow(); showUpdateBar();
+  try { await invoke("update_install"); }
+  catch (e) { Upd.state = "error"; Upd.error = String(e); toast(`Update failed: ${e}`); renderUpdateRow(); $("#updateBar")?.remove(); }
+}
+listen("update-progress", (e) => {
+  const p = e.payload;
+  if (p.installing) Upd.state = "installing";
+  else if (p.total) Upd.pct = Math.min(100, Math.round((p.done / p.total) * 100));
+  renderUpdateRow(); showUpdateBar();
+});
+const updLabel = () => (Upd.state === "downloading" ? `Downloading… ${Upd.pct}%` : Upd.state === "installing" ? "Installing… DuoStream restarts by itself" : "");
+function showUpdateBar() {
+  if (S.popout) return;
+  let bar = $("#updateBar");
+  if (!bar) {
+    if (Upd.state !== "available") return;
+    bar = el('<div class="update-bar" id="updateBar"></div>');
+    document.body.appendChild(bar);
+  }
+  const busy = Upd.state === "downloading" || Upd.state === "installing";
+  bar.innerHTML = `${I.refresh}<span>${busy ? updLabel() : `DuoStream <b>${esc(Upd.version)}</b> is available`}</span>
+    ${busy ? `<div class="upd-prog"><i style="width:${Upd.state === "installing" ? 100 : Upd.pct}%"></i></div>`
+      : `<button class="btn primary sm" data-upd="install">Update now</button><button class="icon-btn" data-upd="later" title="Later">${I.close}</button>`}`;
+}
+/** Settings → Accounts & app: current version + check / update button. */
+function updateRowHTML() {
+  const s = Upd.state;
+  const status = s === "checking" ? "Checking for updates…"
+    : s === "uptodate" ? "You're on the latest version."
+    : s === "available" ? `Version ${esc(Upd.version)} is available.`
+    : s === "error" ? `Couldn't check: ${esc(Upd.error || "")}`
+    : updLabel() || "Updates are signed and install with one click.";
+  const btn = s === "available" ? `<button class="btn primary sm" data-upd="install">Update to ${esc(Upd.version)}</button>`
+    : s === "downloading" || s === "installing" ? `<div class="upd-prog wide"><i style="width:${s === "installing" ? 100 : Upd.pct}%"></i></div>`
+    : `<button class="btn secondary sm" data-upd="check" ${s === "checking" ? "disabled" : ""}>${I.refresh}Check for updates</button>`;
+  return `<div class="setting" id="updRow"><div><b>DuoStream ${esc(Upd.current)}</b><p class="${s === "error" ? "upd-err" : ""}">${status}</p></div>${btn}</div>`;
+}
+function renderUpdateRow() { const r = $("#updRow"); if (r) r.outerHTML = updateRowHTML(); }
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-upd]");
+  if (!b) return;
+  const a = b.dataset.upd;
+  if (a === "check") checkUpdate(true);
+  else if (a === "install") installUpdate();
+  else if (a === "later") $("#updateBar")?.remove();
+});
+
 // ------------------------------------------------------------------ picture-in-picture window (#pip=Platform|login|display)
 async function pipBoot() {
   document.body.classList.add("pip");
@@ -2606,22 +2674,8 @@ async function pipBoot() {
     loadFollows();
   });
   // updates: check GitHub releases shortly after start, then every 6 hours
-  const checkUpdate = async () => {
-    try {
-      const u = await invoke("update_check");
-      if (!u || $("#updateBar")) return;
-      const bar = el(`<div class="update-bar" id="updateBar">${I.refresh}<span>duostream <b>${esc(u.version)}</b> is available</span>
-        <button class="btn primary sm" id="updNow">Update now</button><button class="icon-btn" id="updLater" title="Later">${I.close}</button></div>`);
-      document.body.appendChild(bar);
-      $("#updLater").onclick = () => bar.remove();
-      $("#updNow").onclick = async () => {
-        $("#updNow").disabled = true; $("#updNow").textContent = "Downloading…";
-        try { await invoke("update_install"); } catch (e) { toast(`Update failed: ${e}`); bar.remove(); }
-      };
-    } catch (e) { invoke("js_log", { msg: `update check: ${e}` }); }
-  };
-  setTimeout(checkUpdate, 8000);
-  setInterval(checkUpdate, 6 * 3600e3);
+  setTimeout(() => checkUpdate(false), 8000);
+  setInterval(() => checkUpdate(false), 6 * 3600e3);
   // refresh the stream list every 2 min unless you're scrolled into it (infinite scroll)
   setInterval(() => { if (!S.browse.cards.length || (S.view !== "browse" && S.browse.cards.length <= 60)) loadBrowse(); }, 120000);
 })();

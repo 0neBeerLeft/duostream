@@ -572,7 +572,7 @@ fn run_chat(
             if let Some((user, _)) = auth {
                 let tag = reply_to.as_deref().map(|id| format!("@reply-parent-msg-id={id} ")).unwrap_or_default();
                 ws.send(Message::Text(format!("{tag}PRIVMSG #{login} :{text}").into())).map_err(|e| e.to_string())?;
-                let own = ChatMsg { login: user.clone(), name: user.clone(), color: "#53fc18".to_string(), spans: vec![Span::Text(text)], ..Default::default() };
+                let own = ChatMsg { login: user.clone(), name: user.clone(), color: "#2dd4bf".to_string(), spans: vec![Span::Text(text)], ..Default::default() };
                 if tx.send(own).is_err() {
                     return Ok(());
                 }
