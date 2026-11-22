@@ -1122,14 +1122,20 @@ function renderForYou() {
   const box = $("#forYou"); if (!box) return;
   const fy = S.forYou;
   if (!fy.sections) {
-    box.innerHTML = `<div class="section-title">Loading your page…</div><div class="grid">${skeletons(8)}</div>`;
+    box.innerHTML = `<div class="for-you-intro"><span class="eyebrow">MADE FOR YOUR NEXT WATCH</span><h2>Find your next favorite.</h2><p>Streams from Twitch and Kick, together in one place.</p></div><div class="section-title">Loading your page…</div><div class="grid">${skeletons(8)}</div>`;
     if (Date.now() - fy.at > 5000) loadForYou();
     return;
   }
-  box.innerHTML = fy.sections.map((s, i) => `<section class="fy">
+  const featured = sortCards(fy.sections.flatMap((s) => s.cards), "viewers").find(visibleCard);
+  const hero = featured ? `<button class="featured-stream" data-open="${featured.platform}|${esc(featured.login)}">
+    <span class="featured-art">${featured.thumb ? `<img src="${esc(featured.thumb)}" alt="" loading="lazy">` : ""}</span><span class="featured-scrim"></span><span class="featured-content"><span class="eyebrow"><i class="live-dot"></i> LIVE NOW <span class="feature-separator">·</span> ${esc(featured.category || "STREAMING")}</span>
+    <span class="featured-title">${esc(featured.display)} is live</span><span class="featured-subtitle">${esc(featured.title || "Drop in and say hello")}</span>
+    <span class="featured-action">Watch stream <span aria-hidden="true">↗</span></span></span><span class="featured-viewers">${I.user}${fmt(featured.viewers)} watching</span>
+  </button>` : `<div class="for-you-intro"><span class="eyebrow">YOUR STREAMING HOME</span><h2>Find your next favorite.</h2><p>Explore Twitch and Kick streams, all in one place.</p><button class="btn primary" data-view-btn="browse">Explore live streams</button></div>`;
+  box.innerHTML = `${hero}${fy.sections.map((s, i) => `<section class="fy">
       <div class="section-title">${esc(s.title)}<span class="spacer"></span>${s.cat ? `<button class="btn secondary sm" data-fycat="${i}">See all</button>` : s.more ? `<button class="btn secondary sm" data-view-btn="${s.more}">See all</button>` : ""}</div>
-      <div class="grid">${s.cards.map(cardHTML).join("")}</div></section>`).join("")
-    || `<div class="empty"><h2>Follow some channels or categories</h2><p>Your For you page is built from what you watch.</p></div>`;
+      <div class="grid">${s.cards.map(cardHTML).join("")}</div></section>`).join("")}
+    ${!fy.sections.length ? `<div class="empty"><h2>Follow some channels or categories</h2><p>Your For you page gets better as you follow the creators and categories you love.</p><button class="btn primary" data-view-btn="categories">Explore categories</button></div>` : ""}`;
   if (Date.now() - fy.at > 300000) loadForYou();
 }
 
@@ -1438,7 +1444,9 @@ function setPlayerState(kind) {
   if (kind === "playing") { p.classList.add("hidden"); return; }
   p.classList.remove("hidden");
   if (kind === "buffering" || kind === "loading") p.innerHTML = '<div class="spinner"></div>';
-  else if (kind === "offline") p.innerHTML = `${avatar(S.ch.platform, i.avatar, i.display, "xl")}<h3>${esc(i.display)} is offline</h3><p>Chat is still open.</p>`;
+  else if (kind === "offline") p.innerHTML = document.documentElement.classList.contains("browser-preview")
+    ? `<h3>Browser preview</h3><p>Live playback and chat are available in the desktop app. This channel is sample data.</p>`
+    : `${avatar(S.ch.platform, i.avatar, i.display, "xl")}<h3>${esc(i.display)} is offline</h3><p>Chat is still open.</p>`;
   else if (kind === "error") p.innerHTML = `<h3>Playback stopped</h3><p>${esc(S.ch.error || "Something went wrong.")}</p><button class="btn secondary" id="retryBtn" style="margin-top:8px">Retry</button>`;
   else if (kind === "pip") {
     p.innerHTML = `<div class="pip-note">${I.pip}</div><h3>Playing in picture-in-picture</h3><p>The stream is in its floating window. Chat stays here.</p><button class="btn secondary" id="pipBackBtn" style="margin-top:8px">Bring it back</button>`;
@@ -1542,17 +1550,19 @@ function renderChannelInfo() {
   const { platform, login, info } = S.ch;
   const followed = isFollowed(platform, login);
   box.innerHTML = `
-    ${avatar(platform, info.avatar, info.display, "xl", info.live)}
-    <div class="who">
-      <div class="uname">${esc(info.display)} ${info.live ? '<span class="live-pill">LIVE</span>' : S.ch.loading ? "" : '<span class="offline-tag">OFFLINE</span>'}</div>
-      <div class="stitle" title="${esc(info.title)}">${esc(info.title || (S.ch.loading ? "Loading…" : ""))}</div>
-      <div class="tags">${info.category ? `<span class="tag cat">${esc(info.category)}</span>` : ""}${ptag(platform)}</div>
+    <div class="channel-identity">
+      ${avatar(platform, info.avatar, info.display, "xl", info.live)}
+      <div class="who">
+        <div class="uname">${esc(info.display)} ${info.live ? "" : S.ch.loading ? "" : '<span class="offline-tag">OFFLINE</span>'}</div>
+        <div class="stitle" title="${esc(info.title)}">${esc(info.title || (S.ch.loading ? "Loading…" : ""))}</div>
+        <div class="tags">${info.category ? `<span class="tag cat">${esc(info.category)}</span>` : ""}${ptag(platform)}</div>
+      </div>
     </div>
     <div class="actions">
+      ${info.live ? `<div class="stats"><span class="v">${I.user}<span data-n="${info.viewers || 0}" data-k="c:${akey(platform, login)}" data-full>${(info.viewers || 0).toLocaleString()}</span><small>watching</small></span><span class="uptime-stat"><small>UPTIME</small><span id="uptime">${upClock(info.started)}</span></span></div>` : ""}
       <div class="row">
         <button class="follow-btn ${followed ? "on" : ""}" id="followBtn"><span class="fh">${I.heartFill}<i class="burst"></i></span><span class="fl"><span class="f-a">${followed ? "Following" : "Follow"}</span>${followed ? '<span class="f-b">Unfollow</span>' : ""}</span></button>
       </div>
-      ${info.live ? `<div class="stats"><span class="v">${I.user}<span data-n="${info.viewers || 0}" data-k="c:${akey(platform, login)}" data-full>${(info.viewers || 0).toLocaleString()}</span></span><span id="uptime">${upClock(info.started)}</span></div>` : ""}
     </div>`;
   animateCounts(box);
   $("#followBtn").onclick = () => toggleFollow(platform, login);
@@ -2433,7 +2443,8 @@ function enterApp() {
   $("#shell").classList.remove("hidden");
   $("#sideToggle").innerHTML = I.menu;
   $("#searchBtn").innerHTML = I.search;
-  setView(S.st.follows.length ? "following" : "browse");
+  const previewingInBrowser = document.documentElement.classList.contains("browser-preview");
+  setView(previewingInBrowser || !S.st.follows.length ? "browse" : "following");
   loadFollows();
   if (!S.browse.at) loadBrowse();
 }
