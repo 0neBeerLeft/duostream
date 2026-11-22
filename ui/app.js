@@ -1122,14 +1122,20 @@ function renderForYou() {
   const box = $("#forYou"); if (!box) return;
   const fy = S.forYou;
   if (!fy.sections) {
-    box.innerHTML = `<div class="section-title">Loading your page…</div><div class="grid">${skeletons(8)}</div>`;
+    box.innerHTML = `<div class="for-you-intro"><span class="eyebrow">MADE FOR YOUR NEXT WATCH</span><h2>Find your next favorite.</h2><p>Streams from Twitch and Kick, together in one place.</p></div><div class="section-title">Loading your page…</div><div class="grid">${skeletons(8)}</div>`;
     if (Date.now() - fy.at > 5000) loadForYou();
     return;
   }
-  box.innerHTML = fy.sections.map((s, i) => `<section class="fy">
+  const featured = sortCards(fy.sections.flatMap((s) => s.cards), "viewers").find(visibleCard);
+  const hero = featured ? `<button class="featured-stream" data-open="${featured.platform}|${esc(featured.login)}">
+    <span class="featured-art">${featured.thumb ? `<img src="${esc(featured.thumb)}" alt="" loading="lazy">` : ""}</span><span class="featured-scrim"></span><span class="featured-content"><span class="eyebrow"><i class="live-dot"></i> LIVE NOW <span class="feature-separator">·</span> ${esc(featured.category || "STREAMING")}</span>
+    <span class="featured-title">${esc(featured.display)} is live</span><span class="featured-subtitle">${esc(featured.title || "Drop in and say hello")}</span>
+    <span class="featured-action">Watch stream <span aria-hidden="true">↗</span></span></span><span class="featured-viewers">${I.user}${fmt(featured.viewers)} watching</span>
+  </button>` : `<div class="for-you-intro"><span class="eyebrow">YOUR STREAMING HOME</span><h2>Find your next favorite.</h2><p>Explore Twitch and Kick streams, all in one place.</p><button class="btn primary" data-view-btn="browse">Explore live streams</button></div>`;
+  box.innerHTML = `${hero}${fy.sections.map((s, i) => `<section class="fy">
       <div class="section-title">${esc(s.title)}<span class="spacer"></span>${s.cat ? `<button class="btn secondary sm" data-fycat="${i}">See all</button>` : s.more ? `<button class="btn secondary sm" data-view-btn="${s.more}">See all</button>` : ""}</div>
-      <div class="grid">${s.cards.map(cardHTML).join("")}</div></section>`).join("")
-    || `<div class="empty"><h2>Follow some channels or categories</h2><p>Your For you page is built from what you watch.</p></div>`;
+      <div class="grid">${s.cards.map(cardHTML).join("")}</div></section>`).join("")}
+    ${!fy.sections.length ? `<div class="empty"><h2>Follow some channels or categories</h2><p>Your For you page gets better as you follow the creators and categories you love.</p><button class="btn primary" data-view-btn="categories">Explore categories</button></div>` : ""}`;
   if (Date.now() - fy.at > 300000) loadForYou();
 }
 
@@ -2435,7 +2441,8 @@ function enterApp() {
   $("#shell").classList.remove("hidden");
   $("#sideToggle").innerHTML = I.menu;
   $("#searchBtn").innerHTML = I.search;
-  setView(S.st.follows.length ? "following" : "browse");
+  const previewingInBrowser = document.documentElement.classList.contains("browser-preview");
+  setView(previewingInBrowser || !S.st.follows.length ? "browse" : "following");
   loadFollows();
   if (!S.browse.at) loadBrowse();
 }
