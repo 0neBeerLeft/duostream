@@ -73,6 +73,7 @@ function renderChatSettings() {
       ${ceSwitch("general.badges", "Badges", "Subscriber, moderator, VIP and other chat badges.")}
       ${ceSwitch("general.platformIcon", "Platform indicator", "Small Twitch / Kick mark before each name.")}
       ${ceSwitch("general.linkify", "Clickable links")}
+      ${ceSwitch("general.history", "Recent messages when you join", "Shows chat from just before you opened the channel. Twitch history comes from recent-messages.robotty.de, the service Chatterino uses.")}
       <div class="ce-row"><div><b>Hidden this session</b><p>Messages removed by your filters since the app started.</p></div><span class="ce-stat">${CE.stats.hidden.toLocaleString()}</span></div>
       <div class="ce-row"><div><b>Reset Chat Enhancer</b><p>Restore every setting to its default. Your user list (favorites, ignores, notes) is kept.</p></div><button class="btn secondary sm" data-ceact="resetAll">${S.ceConfirm === "all" ? "Click again to confirm" : "Reset all"}</button></div>`;
   } else if (t === "filters") {
@@ -115,11 +116,11 @@ function renderChatSettings() {
         return `<div class="ce-user">
           ${pbadge(p, "inline")}<span class="ce-uname" style="color:${esc(u.color || "var(--fg)")}">${esc(u.name || login)}</span>
           <span class="grow"></span>
-          <button class="ce-tag ${u.fav ? "on" : ""}" data-uact="fav|${uid}">${I.star}Favorite</button>
-          <button class="ce-tag ${u.ignore ? "on bad" : ""}" data-uact="ignore|${uid}">${I.ban}Ignored</button>
-          <button class="ce-tag ${u.color ? "on" : ""}" data-uact="color|${uid}">${I.palette}Color</button>
-          <button class="ce-tag ${u.note ? "on" : ""}" data-uact="note|${uid}" title="${esc(u.note || "")}">${I.note}Note</button>
-          <button class="icon-btn" data-uact="del|${uid}" title="Forget this user">${I.trash}</button>
+          <button class="ce-tag ${u.fav ? "on" : ""}" data-uact="fav|${esc(uid)}">${I.star}Favorite</button>
+          <button class="ce-tag ${u.ignore ? "on bad" : ""}" data-uact="ignore|${esc(uid)}">${I.ban}Ignored</button>
+          <button class="ce-tag ${u.color ? "on" : ""}" data-uact="color|${esc(uid)}">${I.palette}Color</button>
+          <button class="ce-tag ${u.note ? "on" : ""}" data-uact="note|${esc(uid)}" title="${esc(u.note || "")}">${I.note}Note</button>
+          <button class="icon-btn" data-uact="del|${esc(uid)}" title="Forget this user">${I.trash}</button>
         </div>`;
       }).join("")}</div>` : '<p class="hint">Nobody here yet. Favorites, ignored users, custom colors and notes show up here.</p>'}`;
   } else if (t === "notify") {
@@ -179,8 +180,9 @@ function renderCePreview() {
 }
 
 // keep preview / chat in sync with every change (main window and pop-out)
+const rerenderChatSoon = debounce(rerenderChat, 200);
 CE.onChange(() => {
-  rerenderChat();
+  rerenderChatSoon();
   renderCePreview();
   ceRunTest();
   // inline rule errors without re-rendering the form
@@ -208,7 +210,8 @@ document.addEventListener("click", (e) => {
   if (clr) { e.preventDefault(); ceSet(clr.dataset.ceclear, ""); renderChatSettings(); return; }
   const ua = e.target.closest("[data-uact]");
   if (ua) {
-    const [act, uid] = ua.dataset.uact.split("|");
+    const raw = ua.dataset.uact, cut = raw.indexOf("|");
+    const act = raw.slice(0, cut), uid = raw.slice(cut + 1);
     const p = uid.startsWith("k:") ? "Kick" : "Twitch", login = uid.slice(2), u = CE.cfg.users[uid] || {};
     const after = () => renderChatSettings();
     if (act === "fav") CE.setUser(p, login, { fav: !u.fav });
@@ -271,7 +274,7 @@ document.addEventListener("submit", (e) => {
   if (e.target.id !== "ceAddUser") return;
   e.preventDefault();
   const name = $("#ceAddName").value.trim().replace(/^@/, "");
-  if (!name) return;
+  if (!/^[\w-]{1,40}$/.test(name)) { toast("Usernames are letters, digits, _ and -"); return; }
   CE.setUser($("#ceAddPlat").value, name.toLowerCase(), { fav: true }, name);
   renderChatSettings();
 });

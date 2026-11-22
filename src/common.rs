@@ -34,28 +34,6 @@ pub struct StreamCard {
     pub language: String,
 }
 
-/// Parse "YYYY-MM-DDTHH:MM:SS" / "YYYY-MM-DD HH:MM:SS" (UTC) into unix seconds.
-pub fn parse_ts(s: &str) -> Option<i64> {
-    let n = |a: usize, b: usize| s.get(a..b)?.parse::<i64>().ok();
-    let (y, m, d, hh, mm, ss) = (n(0, 4)?, n(5, 7)?, n(8, 10)?, n(11, 13)?, n(14, 16)?, n(17, 19)?);
-    let y2 = if m <= 2 { y - 1 } else { y };
-    let era = y2.div_euclid(400);
-    let yoe = y2 - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    Some(days * 86400 + hh * 3600 + mm * 60 + ss)
-}
-
-/// "2h 05m" since the stream started.
-pub fn uptime(started: Option<&str>) -> Option<String> {
-    let t = parse_ts(started?)?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
-    let s = (now - t).max(0);
-    Some(if s >= 3600 { format!("{}h {:02}m", s / 3600, (s % 3600) / 60) } else { format!("{}m", s / 60) })
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct Variant {
     pub name: String,
@@ -73,6 +51,8 @@ pub struct Resolved {
     pub kick_chatroom: Option<u64>,
     pub kick_channel_id: Option<u64>,
     pub kick_user_id: Option<u64>,
+    /// Platform user id (Twitch user id / Kick user id): plugins use it for 7TV, BTTV and FFZ emotes.
+    pub user_id: Option<String>,
     pub avatar: Option<String>,
     pub started: Option<String>,
 }
@@ -103,11 +83,26 @@ pub struct ChatMsg {
     /// Raw badge keys: Twitch "set/version", Kick "type" or "subscriber/<months>".
     pub badges: Vec<String>,
     pub reply: Option<Reply>,
+    /// Control lines (not shown as messages): "delete" (target = message id), "clear_user" (target = login,
+    /// text = what happened), "clear_all", "own_failed" (Twitch refused your last message), "me" (your own
+    /// badges/color, from USERSTATE). Empty for normal and system messages.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub target: String,
+    /// Sent before you joined (chat history on join); shown dimmed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub history: bool,
 }
 
 impl ChatMsg {
     pub fn system(text: impl Into<String>) -> Self {
         ChatMsg { color: "#a9adb5".into(), spans: vec![Span::Text(text.into())], system: true, ..Default::default() }
+    }
+    /// A control line; `text` (optional) is shown as a system message by the UI.
+    pub fn control(kind: &str, target: impl Into<String>, text: impl Into<String>) -> Self {
+        let text = text.into();
+        ChatMsg { kind: kind.into(), target: target.into(), system: true, spans: if text.is_empty() { vec![] } else { vec![Span::Text(text)] }, ..Default::default() }
     }
 }
 
@@ -140,16 +135,6 @@ pub fn enc(s: &str) -> String {
         }
     }
     o
-}
-
-pub fn fmt_viewers(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1e3)
-    } else {
-        n.to_string()
-    }
 }
 
 /// Parse "#RRGGBB"; brighten colors that are unreadable on a dark background.

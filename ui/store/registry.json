@@ -12,9 +12,39 @@
       "code": "adblock/plugin.js"
     },
     {
+      "id": "7tv",
+      "name": "7TV Emotes",
+      "version": "1.0.0",
+      "author": "duostream",
+      "description": "Shows 7TV emotes in Twitch and Kick chat and in the emote picker.",
+      "builtin": true,
+      "manifest": "7tv/manifest.json",
+      "code": "7tv/plugin.js"
+    },
+    {
+      "id": "bttv",
+      "name": "BTTV Emotes",
+      "version": "1.0.0",
+      "author": "duostream",
+      "description": "Shows BetterTTV emotes in Twitch chat and in the emote picker.",
+      "builtin": true,
+      "manifest": "bttv/manifest.json",
+      "code": "bttv/plugin.js"
+    },
+    {
+      "id": "ffz",
+      "name": "FFZ Emotes",
+      "version": "1.0.0",
+      "author": "duostream",
+      "description": "Shows FrankerFaceZ emotes in Twitch chat and in the emote picker.",
+      "builtin": true,
+      "manifest": "ffz/manifest.json",
+      "code": "ffz/plugin.js"
+    },
+    {
       "id": "chat-timestamps",
       "name": "Chat Timestamps",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "author": "duostream",
       "description": "Shows the time next to every chat message.",
       "manifest": "chat-timestamps/manifest.json",

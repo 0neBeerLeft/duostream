@@ -17,7 +17,7 @@
 const CE = (() => {
   const DEFAULTS = {
     v: 1,
-    general: { enabled: true, timestamps: false, badges: true, platformIcon: false, linkify: true },
+    general: { enabled: true, timestamps: false, badges: true, platformIcon: false, linkify: true, history: true },
     appearance: { fontSize: 14, font: "Inter", spacing: "normal", emoteSize: 28, nameColors: "platform", compact: false, dimOthers: 100 },
     filters: {
       links: false,

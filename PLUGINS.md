@@ -27,12 +27,12 @@ Open the folder from **Plugins → Installed → Open plugins folder**, drop you
 
 ## plugin.js
 
-The file runs once when the plugin is enabled, with one variable in scope: `api`.
+The file runs once when the plugin is enabled, with one variable in scope: `api`. Each plugin runs in its own sandbox (a Web Worker): there is no `document` or `window`, so everything goes through `api`. Timers, `fetch` and other worker features work as usual.
 
 ### Events
 
 ```js
-api.on("channel:open", (ch) => {});   // { platform, login, display, live, title, category }
+api.on("channel:open", (ch) => {});   // { platform, login, userId, display, live, title, category }
 api.on("channel:leave", () => {});
 api.on("view", ({ view }) => {});      // "following" | "browse" | "channel" | "plugins" | "accounts"
 api.on("player:playing", () => {});
@@ -74,7 +74,7 @@ api.addStyle(".msg .u { text-decoration: underline; }");   // removed automatica
 api.toast("Hello");
 ```
 
-`api.icons` has the app's SVG icons (`shield`, `bell`, `heart`, `gear`, `chat`, `puzzle`, `play`, …). Any SVG string works as an icon.
+`api.icons` has the app's SVG icons (`shield`, `bell`, `heart`, `gear`, `chat`, `puzzle`, `play`, …). Any other `<svg>` string works as an icon too; it is drawn in the button color.
 
 ### App
 
@@ -84,7 +84,8 @@ api.view();                           // current page
 api.me();                             // { twitch: "name" | null, kick: "name" | null }
 api.openChannel("Twitch", "xqc");
 api.reloadPlayer();
-await api.adStatus();                 // { ad_break, ads_blocked }
+await api.adStatus();                 // { ad_break, ads_blocked } of the stream being watched
+api.setEmotes([{ name, url }]);       // emotes for the emote picker (https images), replaces your previous list
 api.storage.get("key", defaultValue); // per-plugin storage
 api.storage.set("key", value);
 api.appVersion;
@@ -93,7 +94,7 @@ api.appVersion;
 ### Cleanup
 
 Everything a plugin adds through `api` is removed when it is disabled or uninstalled. For anything
-else (timers, your own DOM changes) register a cleanup:
+else (timers, open connections) register a cleanup. The sandbox is shut down right after, so timers stop anyway:
 
 ```js
 const t = setInterval(tick, 1000);
@@ -126,5 +127,8 @@ Host a `registry.json` anywhere over HTTPS (a GitHub repo with raw links works):
 
 ## Security
 
-Plugins run inside the app with the same access as the app itself, like browser extensions.
-Only install plugins from people you trust.
+Plugins are sandboxed. A plugin cannot call the app directly: it can't read your sign-ins, chat or follow as you,
+spend channel points, change settings or install other plugins. It only gets what `api` offers.
+
+A plugin does see the chat messages it is given, can use the internet (`fetch`) and can restyle the app with
+`api.addStyle`, so only install plugins from people you trust.

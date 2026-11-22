@@ -20,7 +20,6 @@ use tauri::{AppHandle, Emitter};
 static CFG: OnceLock<Mutex<store::Config>> = OnceLock::new();
 static CHAT_GEN: AtomicU64 = AtomicU64::new(0);
 static CHAT_OUT: Mutex<Option<mpsc::Sender<twitch::Outgoing>>> = Mutex::new(None);
-static CHAT_KICK_UID: Mutex<Option<u64>> = Mutex::new(None);
 static CHAT_KICK_ROOM: Mutex<Option<u64>> = Mutex::new(None);
 /// Channel whose chat is open (shared with the pop-out chat window).
 static CHAT_CTX: Mutex<Option<serde_json::Value>> = Mutex::new(None);
@@ -70,8 +69,6 @@ struct AppState {
     low_latency: bool,
     sidebar_collapsed: bool,
     show_chat: bool,
-    kick_client_id: String,
-    has_kick_secret: bool,
     ads_blocked: u64,
     notify_live: bool,
     close_to_tray: bool,
@@ -82,6 +79,8 @@ struct AppState {
     followed_categories: Vec<serde_json::Value>,
     hidden_channels: Vec<String>,
     hidden_categories: Vec<String>,
+    notify_muted: Vec<String>,
+    autostart: bool,
 }
 
 fn snapshot() -> AppState {
@@ -96,8 +95,6 @@ fn snapshot() -> AppState {
         low_latency: c.low_latency,
         sidebar_collapsed: c.sidebar_collapsed,
         show_chat: c.show_chat,
-        kick_client_id: c.kick_client_id.clone(),
-        has_kick_secret: !c.kick_client_secret.is_empty(),
         ads_blocked: adblock::ADS_BLOCKED.load(Ordering::Relaxed),
         notify_live: c.notify_live,
         close_to_tray: c.close_to_tray,
@@ -108,7 +105,67 @@ fn snapshot() -> AppState {
         followed_categories: c.followed_categories.clone(),
         hidden_channels: c.hidden_channels.clone(),
         hidden_categories: c.hidden_categories.clone(),
+        notify_muted: c.notify_muted.clone(),
+        autostart: c.autostart,
     }
+}
+
+/// Go-live notifications on/off for one followed channel.
+#[tauri::command]
+fn set_notify(platform: Platform, login: String, on: bool) -> AppState {
+    {
+        let mut c = cfg();
+        let key = akey(platform, &login.to_lowercase());
+        c.notify_muted.retain(|k| *k != key);
+        if !on {
+            c.notify_muted.push(key);
+        }
+    }
+    save();
+    snapshot()
+}
+
+/// Start with Windows: a Run entry that launches duostream hidden in the tray.
+#[tauri::command]
+fn set_autostart(on: bool) -> Result<AppState, String> {
+    autostart_registry(on)?;
+    cfg().autostart = on;
+    save();
+    Ok(snapshot())
+}
+
+fn autostart_registry(on: bool) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    let mut cmd = std::process::Command::new("reg");
+    if on {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        cmd.args(["add", KEY, "/v", "duostream", "/t", "REG_SZ", "/d", &format!("\"{}\" --tray", exe.display()), "/f"]);
+    } else {
+        cmd.args(["delete", KEY, "/v", "duostream", "/f"]);
+    }
+    let ok = cmd.creation_flags(0x0800_0000).status().map(|s| s.success()).unwrap_or(false);
+    if ok || !on {
+        Ok(())
+    } else {
+        Err("Couldn't add duostream to Windows startup".into())
+    }
+}
+
+/// A pasted Twitch video or clip link: { login, title } of its channel.
+#[tauri::command]
+async fn twitch_link(kind: String, id: String) -> Result<serde_json::Value, String> {
+    blocking(move || twitch::link_owner(&kind, &id)).await
+}
+
+/// Platform user id for plugins (used by the pop-out chat window, which has no resolved channel info).
+#[tauri::command]
+async fn user_id(platform: Platform, login: String) -> Option<String> {
+    blocking(move || match platform {
+        Platform::Twitch => twitch::user_id(&login),
+        Platform::Kick => kick::user_id(&login),
+    })
+    .await
 }
 
 #[tauri::command]
@@ -197,6 +254,7 @@ fn import_twitch_follows() -> Result<(), String> {
         c.follows.extend(list.into_iter().map(|login| store::Follow { platform: Platform::Twitch, login }));
     }
     save();
+    forget_follow_rows();
     Ok(())
 }
 
@@ -209,7 +267,9 @@ fn import_kick_follows() -> Result<usize, String> {
     let list = kick::followed(&session)?;
     let n = list.len();
     {
+        // the account is the source of truth, like Twitch: unfollows made on kick.com go away here too
         let mut c = cfg();
+        c.follows.retain(|f| f.platform != Platform::Kick);
         for slug in list {
             if !c.follows.iter().any(|f| f.platform == Platform::Kick && f.login == slug) {
                 c.follows.push(store::Follow { platform: Platform::Kick, login: slug });
@@ -217,8 +277,15 @@ fn import_kick_follows() -> Result<usize, String> {
         }
     }
     save();
+    forget_follow_rows();
     log_line(&format!("[follows] imported {n} Kick follows"));
     Ok(n)
+}
+
+/// Network trouble (offline, DNS, timeout, Cloudflare hiccup) as opposed to the platform rejecting a session.
+fn is_network_error(e: &str) -> bool {
+    let e = e.to_ascii_lowercase();
+    e.starts_with("network error") || e.contains("http 000") || e.contains("empty response") || e.contains("timed out") || e.contains("cloudflare") || e.contains("http 5")
 }
 
 /// Re-validate saved sessions (refreshing tokens) and sync Twitch follows. Returns fresh state + notes.
@@ -226,13 +293,15 @@ fn import_kick_follows() -> Result<usize, String> {
 async fn restore_sessions() -> (AppState, Vec<String>) {
     blocking(|| {
         let mut notes = Vec::new();
-        let (tw, kk, id, secret) = {
+        let (tw, kk) = {
             let c = cfg();
-            (c.twitch.clone(), c.kick.clone(), c.kick_client_id.clone(), c.kick_client_secret.clone())
+            (c.twitch.clone(), c.kick.clone())
         };
+        // Only a real rejection signs you out; when Twitch/Kick can't be reached the saved session is kept.
         if let Some(t) = tw {
             match auth::twitch_restore(&t) {
                 Ok(a) => cfg().twitch = Some(a),
+                Err(e) if is_network_error(&e) => notes.push("Couldn't reach Twitch. You're still signed in; it retries in the background.".to_string()),
                 Err(_) => {
                     cfg().twitch = None;
                     notes.push("Your Twitch session expired. Sign in again.".to_string());
@@ -240,14 +309,20 @@ async fn restore_sessions() -> (AppState, Vec<String>) {
             }
         }
         if let Some(k) = kk {
-            match auth::kick_restore(&k, &id, &secret) {
+            match auth::kick_restore(&k) {
                 Ok(a) => cfg().kick = Some(a),
+                Err(_) if !k.web => {
+                    cfg().kick = None;
+                    notes.push("Kick sign-in changed: please sign in to Kick once more.".to_string());
+                }
+                Err(e) if is_network_error(&e) => notes.push("Couldn't reach Kick. You're still signed in.".to_string()),
                 Err(_) => {
                     cfg().kick = None;
                     notes.push("Your Kick session expired. Sign in again.".to_string());
                 }
             }
         }
+        forget_follow_rows();
         save();
         if let Err(e) = import_twitch_follows() {
             notes.push(format!("Couldn't load your Twitch follows: {e}"));
@@ -263,34 +338,7 @@ async fn restore_sessions() -> (AppState, Vec<String>) {
 
 // ------------------------------------------------------------------ content
 
-#[tauri::command]
-async fn browse(category: String) -> Result<Vec<StreamCard>, String> {
-    blocking(move || {
-        let cat = category.clone();
-        let th = std::thread::spawn(move || twitch::top_streams(&cat));
-        let k = kick::top_streams();
-        let t = th.join().unwrap_or_else(|_| Err("Twitch lookup failed".into()));
-        let filter = category.trim().to_lowercase();
-        let mut out: Vec<StreamCard> = Vec::new();
-        let mut errs = Vec::new();
-        match t {
-            Ok(v) => out.extend(v),
-            Err(e) => errs.push(e),
-        }
-        match k {
-            Ok(v) => out.extend(v.into_iter().filter(|c| filter.is_empty() || c.category.to_lowercase().contains(&filter))),
-            Err(e) => errs.push(e),
-        }
-        if out.is_empty() && !errs.is_empty() {
-            return Err(errs.join(" · "));
-        }
-        out.sort_by(|a, b| b.viewers.cmp(&a.viewers));
-        Ok(out)
-    })
-    .await
-}
-
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct FollowRow {
     platform: Platform,
     login: String,
@@ -300,7 +348,41 @@ struct FollowRow {
 
 #[tauri::command]
 async fn follows_status() -> Vec<FollowRow> {
-    blocking(follow_rows).await
+    blocking(|| follow_rows_cached(std::time::Duration::from_secs(20))).await
+}
+
+/// The last follow check, shared by the UI and the background notifier.
+static FOLLOW_ROWS: Mutex<Option<(std::time::Instant, Vec<FollowRow>)>> = Mutex::new(None);
+/// Held while a check runs: a second caller waits for it and reuses its result instead of starting another.
+static FOLLOW_RUN: Mutex<()> = Mutex::new(());
+/// Last successful state per channel ("t:login"): used when a check fails, so a hiccup doesn't look like
+/// the channel going offline (and then "going live" again a minute later).
+static LAST_ROWS: Mutex<Option<HashMap<String, FollowRow>>> = Mutex::new(None);
+
+fn last_known(platform: Platform, login: &str) -> FollowRow {
+    let key = akey(platform, login);
+    let row = LAST_ROWS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).cloned());
+    row.unwrap_or_else(|| FollowRow { platform, login: login.to_string(), avatar: cfg().avatars.get(&key).cloned(), live: None })
+}
+
+/// Kick live checks run on this many threads (each is a curl.exe process).
+const KICK_WORKERS: usize = 6;
+
+fn follow_rows_cached(max_age: std::time::Duration) -> Vec<FollowRow> {
+    let _running = FOLLOW_RUN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((t, rows)) = &*FOLLOW_ROWS.lock().unwrap_or_else(|e| e.into_inner()) {
+        if t.elapsed() < max_age {
+            return rows.clone();
+        }
+    }
+    let rows = follow_rows();
+    *FOLLOW_ROWS.lock().unwrap_or_else(|e| e.into_inner()) = Some((std::time::Instant::now(), rows.clone()));
+    rows
+}
+
+/// Follows changed (follow/unfollow, sign-in): the next check must not reuse old rows.
+fn forget_follow_rows() {
+    *FOLLOW_ROWS.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Live status of every followed channel (both platforms), remembering avatars.
@@ -311,53 +393,96 @@ fn follow_rows() -> Vec<FollowRow> {
         let kk: Vec<String> = follows.iter().filter(|f| f.platform == Platform::Kick).map(|f| f.login.clone()).collect();
         let mut rows = Vec::new();
         if !tw.is_empty() {
-            if let Ok(v) = twitch::live_status(&tw) {
-                rows.extend(v.into_iter().map(|(login, avatar, live)| FollowRow { platform: Platform::Twitch, login, avatar, live }));
+            match twitch::live_status(&tw) {
+                Ok(v) => rows.extend(v.into_iter().map(|(login, avatar, live)| FollowRow { platform: Platform::Twitch, login, avatar, live })),
+                Err(_) => rows.extend(tw.iter().map(|l| last_known(Platform::Twitch, l))),
             }
         }
-        let handles: Vec<_> = kk.into_iter().map(|s| std::thread::spawn(move || (s.clone(), kick::live_card(&s).unwrap_or((None, None))))).collect();
-        for h in handles {
-            if let Ok((login, (avatar, live))) = h.join() {
-                rows.push(FollowRow { platform: Platform::Kick, login, avatar, live });
+        // a few workers pull from the list (one curl.exe each), instead of a process per channel at once
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let kick_rows: Mutex<Vec<FollowRow>> = Mutex::new(Vec::new());
+        std::thread::scope(|sc| {
+            for _ in 0..KICK_WORKERS.min(kk.len()) {
+                sc.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(login) = kk.get(i) else { break };
+                    let row = match kick::live_card(login) {
+                        Ok((avatar, live)) => FollowRow { platform: Platform::Kick, login: login.clone(), avatar, live },
+                        Err(_) => last_known(Platform::Kick, login), // Cloudflare / network hiccup
+                    };
+                    kick_rows.lock().unwrap_or_else(|e| e.into_inner()).push(row);
+                });
             }
-        }
+        });
+        rows.extend(kick_rows.into_inner().unwrap_or_else(|e| e.into_inner()));
         {
+            let mut g = LAST_ROWS.lock().unwrap_or_else(|e| e.into_inner());
+            let last = g.get_or_insert_with(HashMap::new);
+            for r in &rows {
+                last.insert(akey(r.platform, &r.login), r.clone());
+            }
+        }
+        let changed = {
             let mut c = cfg();
+            let mut changed = false;
             for r in &rows {
                 if let Some(a) = &r.avatar {
-                    c.avatars.insert(akey(r.platform, &r.login), a.clone());
+                    changed |= c.avatars.insert(akey(r.platform, &r.login), a.clone()).as_ref() != Some(a);
                 }
             }
+            changed
+        };
+        if changed {
+            save();
         }
-        save();
         rows
+    }
+}
+
+/// A go-live notification; clicking it opens that stream. Falls back to a plain notification.
+fn live_toast(app: &AppHandle, title: &str, body: &str, arg: String) {
+    use tauri_plugin_notification::NotificationExt;
+    let app2 = app.clone();
+    let shown = tauri_winrt_notification::Toast::new(APP_ID)
+        .title(title)
+        .text1(body)
+        .on_activated(move |_| {
+            show_main(&app2);
+            let _ = app2.emit("open-arg", arg.clone());
+            Ok(())
+        })
+        .show();
+    if shown.is_err() {
+        let _ = app.notification().builder().title(title).body(body).show();
     }
 }
 
 /// Background loop: refresh follows every 90 s, push them to the UI, and notify on go-live.
 fn live_notifier(app: AppHandle) {
-    use tauri_plugin_notification::NotificationExt;
     // live set + every channel seen last round: only notify for channels we already knew were
     // offline (newly imported follows that are already live must not trigger "went live").
-    let mut known: Option<(std::collections::HashSet<(Platform, String)>, std::collections::HashSet<(Platform, String)>)> = None;
+    type Seen = std::collections::HashSet<(Platform, String)>;
+    let mut known: Option<(Seen, Seen)> = None;
     loop {
         let signed_in = {
             let c = cfg();
             c.twitch.is_some() || c.kick.is_some()
         };
         if signed_in {
-            let rows = follow_rows();
+            let rows = follow_rows_cached(std::time::Duration::from_secs(30));
             let live: std::collections::HashSet<(Platform, String)> = rows.iter().filter(|r| r.live.is_some()).map(|r| (r.platform, r.login.clone())).collect();
             let all: std::collections::HashSet<(Platform, String)> = rows.iter().map(|r| (r.platform, r.login.clone())).collect();
             if let Some((prev_live, prev_all)) = &known {
                 if cfg().notify_live {
+                    let muted = cfg().notify_muted.clone();
                     for r in rows.iter().filter(|r| {
                         let k = (r.platform, r.login.clone());
-                        r.live.is_some() && prev_all.contains(&k) && !prev_live.contains(&k)
+                        r.live.is_some() && prev_all.contains(&k) && !prev_live.contains(&k) && !muted.contains(&akey(r.platform, &r.login))
                     }) {
-                        let c = r.live.as_ref().unwrap();
+                        let Some(c) = r.live.as_ref() else { continue };
                         let body = if c.category.is_empty() { c.title.clone() } else { format!("{} · {}", c.category, c.title) };
-                        let _ = app.notification().builder().title(format!("{} is live on {}", c.display, r.platform.name())).body(body).show();
+                        let arg = format!("{}:{}", if r.platform == Platform::Twitch { "twitch" } else { "kick" }, r.login);
+                        live_toast(&app, &format!("{} is live on {}", c.display, r.platform.name()), &body, arg);
                     }
                 }
             }
@@ -481,7 +606,7 @@ async fn search_all(q: String) -> serde_json::Value {
         let (chans, kcats) = search_channels(&q, 10, 8);
         let (games, videos) = extra.join().unwrap_or_default();
         let mut live = streams.join().unwrap_or_default();
-        live.sort_by(|a, b| b.viewers.cmp(&a.viewers));
+        live.sort_by_key(|c| std::cmp::Reverse(c.viewers));
         json!({ "channels": chans, "live": live, "categories": merge_categories(games, kcats), "videos": videos })
     })
     .await
@@ -497,16 +622,16 @@ async fn browse_page(
     tag: String,
     drops: bool,
     twitch_cursor: Option<String>,
-    kick_page: Option<u32>,
+    kick_cursor: Option<String>,
     first: bool,
 ) -> Result<serde_json::Value, String> {
     blocking(move || {
         let want_t = platform != "Kick" && (first || twitch_cursor.is_some());
-        let want_k = platform != "Twitch" && !drops && (first || kick_page.is_some());
+        // Kick only lists by most viewers (no ascending / start-time sort) and has no drops filter
+        let want_k = platform != "Twitch" && !drops && sort == "viewers" && (first || kick_cursor.is_some());
         let (s2, l2, t2) = (sort.clone(), language.clone(), tag.clone());
         let th = std::thread::spawn(move || if want_t { Some(twitch::browse(&s2, &l2, &t2, drops, twitch_cursor.as_deref())) } else { None });
-        let page = kick_page.unwrap_or(1);
-        let k = if want_k { Some(kick::browse(&language, page, sort == "viewers_asc")) } else { None };
+        let k = if want_k { Some(kick::browse(&language, kick_cursor.as_deref())) } else { None };
         let t = th.join().unwrap_or(None);
         let mut cards = Vec::new();
         let mut errs = Vec::new();
@@ -521,12 +646,10 @@ async fn browse_page(
             None => {}
         }
         match k {
-            Some(Ok((c, more))) => {
+            Some(Ok((c, next))) => {
                 let tl = tag.to_lowercase();
                 cards.extend(c.into_iter().filter(|x| tl.is_empty() || x.tags.iter().any(|t| t.to_lowercase() == tl)));
-                if more {
-                    k_next = Some(page + 1);
-                }
+                k_next = next;
             }
             Some(Err(e)) => errs.push(e),
             None => {}
@@ -534,22 +657,17 @@ async fn browse_page(
         if cards.is_empty() && !errs.is_empty() && first {
             return Err(errs.join(" · "));
         }
-        Ok(json!({ "cards": cards, "twitch_cursor": t_next, "kick_page": k_next }))
+        Ok(json!({ "cards": cards, "twitch_cursor": t_next, "kick_cursor": k_next }))
     })
     .await
 }
 
 /// Save the last `seconds` of the live stream to Videos\duostream. Returns the file path.
 #[tauri::command]
-async fn save_clip(seconds: f64) -> Result<String, String> {
+async fn save_clip(seconds: f64, login: Option<String>, behind: Option<f64>) -> Result<String, String> {
     blocking(move || {
-        let (login, bytes, ext) = adblock::clip(seconds.clamp(5.0, 300.0))?;
         let base = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from).unwrap_or_else(|| ".".into());
-        let dir = base.join("Videos").join("duostream");
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let path = dir.join(format!("{login}-{ts}.{ext}"));
-        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        let path = adblock::clip(login.as_deref(), seconds.clamp(5.0, 300.0), behind.unwrap_or(0.0).max(0.0), &base.join("Videos").join("duostream"))?;
         Ok(path.to_string_lossy().into_owned())
     })
     .await
@@ -558,9 +676,11 @@ async fn save_clip(seconds: f64) -> Result<String, String> {
 /// Show a saved file in Explorer.
 #[tauri::command]
 fn reveal_file(path: String) {
-    let p = std::path::PathBuf::from(&path);
-    let videos = std::env::var_os("USERPROFILE").map(|u| std::path::PathBuf::from(u).join("Videos").join("duostream"));
+    // canonical paths, so "..\\" can't point outside the clips folder
+    let Ok(p) = std::fs::canonicalize(&path) else { return };
+    let videos = std::env::var_os("USERPROFILE").and_then(|u| std::fs::canonicalize(std::path::PathBuf::from(u).join("Videos").join("duostream")).ok());
     if videos.map(|v| p.starts_with(v)).unwrap_or(false) && p.is_file() {
+        let p = std::path::PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\")); // explorer can't take \\?\ paths
         let _ = std::process::Command::new("explorer").arg(format!("/select,{}", p.display())).spawn();
     }
 }
@@ -670,46 +790,95 @@ fn set_plugin_sources(sources: Vec<String>) {
 
 /// First run: install built-in plugins shipped inside the app (store/<id>/...).
 fn seed_builtin_plugins(app: &tauri::App) {
-    if cfg().plugins_seeded {
-        return;
+    {
+        // v0.6 installed only ad block, marked with plugins_seeded
+        let mut c = cfg();
+        if c.plugins_seeded && !c.seeded_plugins.iter().any(|x| x == "adblock") {
+            c.seeded_plugins.push("adblock".into());
+        }
     }
     let res = app.asset_resolver();
-    for id in ["adblock"] {
+    for id in ["adblock", "7tv", "bttv", "ffz"] {
+        if cfg().seeded_plugins.iter().any(|x| x == id) {
+            continue;
+        }
+        cfg().seeded_plugins.push(id.to_string());
         let (Some(m), Some(code)) = (res.get(format!("store/{id}/manifest.json")), res.get(format!("store/{id}/plugin.js"))) else { continue };
         let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&m.bytes) else { continue };
         if write_plugin(&manifest, &String::from_utf8_lossy(&code.bytes)).is_ok() {
             cfg().plugins.insert(id.to_string(), true);
         }
     }
-    cfg().plugins_seeded = true;
     save();
+}
+
+/// Main window hidden in the tray (playback already stopped by the UI): freeze the page and let WebView2 release
+/// its memory. `false` wakes it instantly. Live notifications and drop claiming run here in Rust, unaffected.
+fn webview_sleep(w: &tauri::WebviewWindow, sleep: bool) {
+    let _ = w.with_webview(move |wv| unsafe {
+        use webview2_com::Microsoft::Web::WebView2::Win32::*;
+        use windows_core::Interface;
+        let ctrl = wv.controller();
+        let Ok(core) = ctrl.CoreWebView2() else { return };
+        if let Ok(c19) = core.cast::<ICoreWebView2_19>() {
+            let level = if sleep { COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW } else { COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL };
+            let _ = c19.SetMemoryUsageTargetLevel(level);
+        }
+        let Ok(c3) = core.cast::<ICoreWebView2_3>() else { return };
+        if sleep {
+            let _ = ctrl.SetIsVisible(false); // TrySuspend only works on a non-visible webview
+            let _ = c3.TrySuspend(&webview2_com::TrySuspendCompletedHandler::create(Box::new(|_, _| Ok(()))));
+        } else {
+            let _ = ctrl.SetIsVisible(true);
+            let _ = c3.Resume();
+        }
+    });
+}
+
+/// Called by the UI once it has torn down playback after being closed to the tray.
+#[tauri::command]
+fn tray_sleep(app: AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        if !w.is_visible().unwrap_or(true) {
+            webview_sleep(&w, true);
+        }
+    }
 }
 
 fn show_main(app: &AppHandle) {
     use tauri::Manager;
     if let Some(w) = app.get_webview_window("main") {
+        let was_hidden = !w.is_visible().unwrap_or(true);
+        webview_sleep(&w, false);
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+        if was_hidden {
+            let _ = w.emit("window-shown", ()); // refresh anything that changed while asleep
+        }
     }
 }
 
 #[tauri::command]
-async fn resolve(platform: Platform, login: String) -> Result<Resolved, String> {
+async fn resolve(platform: Platform, login: String, meta: Option<bool>) -> Result<Resolved, String> {
+    // meta: title / viewers / live only, without fetching playback URLs
+    let meta = meta.unwrap_or(false);
     blocking(move || match platform {
-        Platform::Twitch => twitch::resolve(&login),
-        Platform::Kick => kick::resolve(&login),
+        Platform::Twitch => twitch::resolve(&login, meta),
+        Platform::Kick => kick::resolve(&login, meta),
     })
     .await
 }
 
 /// URL the in-app player should load. Twitch goes through the local ad-filtering proxy.
 #[tauri::command]
-fn play_url(platform: Platform, login: String, name: String, url: String) -> String {
+fn play_url(platform: Platform, login: String, name: String, url: String, dvr: Option<bool>) -> String {
+    let dvr = dvr.unwrap_or(true);
     match platform {
-        Platform::Twitch => adblock::wrap(&login, &name, &url, adblock_active()),
+        Platform::Twitch => adblock::wrap(&format!("t:{login}"), &login, &name, &url, adblock_active(), dvr),
         // Kick goes through the same local proxy (no ad filter) for rewind + clips.
-        Platform::Kick => adblock::wrap(&login, &name, &url, false),
+        Platform::Kick => adblock::wrap(&format!("k:{login}"), &login, &name, &url, false, dvr),
     }
 }
 
@@ -718,8 +887,8 @@ fn play_url(platform: Platform, login: String, name: String, url: String) -> Str
 async fn search(name: String) -> Option<Platform> {
     blocking(move || {
         let n1 = name.clone();
-        let th = std::thread::spawn(move || twitch::resolve(&n1));
-        let k = kick::resolve(&name);
+        let th = std::thread::spawn(move || twitch::resolve(&n1, true));
+        let k = kick::resolve(&name, true);
         let t = th.join().unwrap_or_else(|_| Err("lookup failed".into()));
         match (&t, &k) {
             (Ok(t), Ok(k)) => Some(match (t.live, k.live) {
@@ -760,6 +929,7 @@ async fn set_follow(platform: Platform, login: String, on: bool) -> Result<(), S
         }
     }
     save();
+    forget_follow_rows();
     Ok(())
 }
 
@@ -795,27 +965,6 @@ fn login_cancel() {
 }
 
 #[tauri::command]
-async fn kick_login(client_id: String, client_secret: String) -> Result<String, String> {
-    let id = client_id.trim().to_string();
-    let secret = if client_secret == "__keep__" { cfg().kick_client_secret.clone() } else { client_secret.trim().to_string() };
-    if id.is_empty() || secret.is_empty() {
-        return Err("Enter your Kick app's Client ID and Client Secret first.".into());
-    }
-    {
-        let mut c = cfg();
-        c.kick_client_id = id.clone();
-        c.kick_client_secret = secret.clone();
-    }
-    save();
-    let cancel = new_cancel();
-    let a = blocking(move || auth::kick_login(&id, &secret, &cancel)).await?;
-    let name = a.username.clone();
-    cfg().kick = Some(a);
-    save();
-    Ok(format!("Signed in to Kick as {name}"))
-}
-
-#[tauri::command]
 fn sign_out(platform: Platform) {
     {
         let mut c = cfg();
@@ -832,6 +981,7 @@ fn sign_out(platform: Platform) {
         }
     }
     save();
+    forget_follow_rows();
 }
 
 // ------------------------------------------------------------------ channel tabs, categories, chat extras
@@ -919,7 +1069,7 @@ async fn category_streams(twitch_name: Option<String>, kick_slug: Option<String>
         if let Ok(Some(Ok(t))) = th.join() {
             out.extend(t);
         }
-        out.sort_by(|a, b| b.viewers.cmp(&a.viewers));
+        out.sort_by_key(|c| std::cmp::Reverse(c.viewers));
         Ok(out)
     })
     .await
@@ -1143,10 +1293,12 @@ async fn drops_connect(app: AppHandle, platform: Platform) -> Result<(), String>
 /// Injected into twitch.tv pages we open: reports the Client-Integrity header set Twitch's own
 /// code attaches to its GQL requests, so drops queries pass Twitch's integrity check.
 fn integrity_script() -> String {
-    let port = adblock::port().unwrap_or(0);
+    // JSON-quoted so the URL drops into the script as a string literal ("" = proxy not running)
+    let ti = serde_json::to_string(&adblock::ti_url().unwrap_or_default()).unwrap_or_else(|_| "\"\"".into());
     format!(
         r#"(function(){{
-  if (location.hostname.indexOf('twitch.tv') < 0 || !{port}) return;
+  var TI = {ti};
+  if (location.hostname.indexOf('twitch.tv') < 0 || !TI) return;
   var of = window.fetch, sent = 0;
   function pick(h, k) {{
     if (!h) return null;
@@ -1162,7 +1314,7 @@ fn integrity_script() -> String {
         var ci = pick(h, 'Client-Integrity');
         if (ci) {{
           sent = Date.now();
-          of('http://127.0.0.1:{port}/ti', {{ method: 'POST', headers: {{ 'content-type': 'text/plain' }},
+          of(TI, {{ method: 'POST', headers: {{ 'content-type': 'text/plain' }},
             body: JSON.stringify({{ integrity: ci, device: pick(h, 'X-Device-Id'), session: pick(h, 'Client-Session-Id'),
               client: pick(h, 'Client-Id'), ua: navigator.userAgent, at: Date.now() }}) }}).catch(function(){{}});
         }}
@@ -1202,7 +1354,7 @@ fn refresh_integrity(app: &AppHandle) -> bool {
     let Ok(url) = "https://www.twitch.tv/drops/inventory".parse() else { return false };
     let Ok(w) = tauri::WebviewWindowBuilder::new(app, "twitch-integrity", tauri::WebviewUrl::External(url))
         .visible(false)
-        .initialization_script(&integrity_script())
+        .initialization_script(integrity_script())
         .build()
     else {
         return false;
@@ -1319,6 +1471,29 @@ async fn drops_claim(platform: Platform, id: String, campaign: Option<String>) -
     .await
 }
 
+/// Every 10 minutes: refresh the Twitch token shortly before it expires, so chat, points and follows keep
+/// working in long sessions. Chat picks the new token up on its next reconnect.
+fn token_keeper() {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(600));
+        let Some(a) = cfg().twitch.clone() else { continue };
+        match auth::twitch_keep_fresh(&a) {
+            Ok(Some(fresh)) => {
+                {
+                    let mut c = cfg();
+                    if c.twitch.as_ref().is_some_and(|x| x.login == fresh.login) {
+                        c.twitch = Some(fresh);
+                    }
+                }
+                save();
+                log_line("[auth] Twitch token refreshed");
+            }
+            Ok(None) => {}
+            Err(e) => log_line(&format!("[auth] Twitch token refresh failed: {e}")),
+        }
+    }
+}
+
 /// Every 5 minutes: claim finished drops (if auto-claim is on) and notify.
 fn drops_claimer(app: AppHandle) {
     use tauri_plugin_notification::NotificationExt;
@@ -1400,7 +1575,7 @@ fn twitch_watcher(app: AppHandle, gen: u64, login: String) {
         } else {
             twitch::watch_tick(&tv.token, auth::TWITCH_CLIENT_ID, &login)
         };
-        if n % 3 == 0 {
+        if n.is_multiple_of(3) {
             if let Ok(mut p) = twitch::points(&tv.token, &login) {
                 if let (true, Some(claim), Some(ch)) = (auto, p["claim"].as_str().map(String::from), p["channel_id"].as_str().map(String::from)) {
                     if twitch::claim_points(&tv.token, &ch, &claim).is_ok() {
@@ -1428,22 +1603,24 @@ fn chat_join(
     login: String,
     display: Option<String>,
     kick_chatroom: Option<u64>,
-    kick_user_id: Option<u64>,
+    #[allow(unused_variables)] kick_user_id: Option<u64>,
     kick_channel_id: Option<u64>,
+    history: Option<bool>,
 ) -> u64 {
+    let history = history.unwrap_or(true);
     let gen = CHAT_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let (tx, rx) = mpsc::channel::<ChatMsg>();
     *CHAT_OUT.lock().unwrap() = None;
-    *CHAT_KICK_UID.lock().unwrap() = kick_user_id;
     *CHAT_KICK_ROOM.lock().unwrap() = kick_chatroom;
     let ctx = json!({ "gen": gen, "platform": platform, "login": login, "display": display.unwrap_or_else(|| login.clone()) });
     *CHAT_CTX.lock().unwrap() = Some(ctx.clone());
     let _ = app.emit("chat-context", ctx);
     match platform {
         Platform::Twitch => {
-            let a = cfg().twitch.as_ref().map(|a| (a.login.clone(), a.token.clone()));
-            let signed = a.is_some();
-            *CHAT_OUT.lock().unwrap() = Some(twitch::spawn_chat(login.to_lowercase(), a, tx));
+            let signed = cfg().twitch.is_some();
+            let auth = || cfg().twitch.as_ref().map(|a| (a.login.clone(), a.token.clone()));
+            twitch::watch_raids(login.to_lowercase(), tx.clone(), move || gen_alive(gen));
+            *CHAT_OUT.lock().unwrap() = Some(twitch::spawn_chat(login.to_lowercase(), auth, tx, move || gen_alive(gen), history));
             if signed {
                 let (app2, l) = (app.clone(), login.to_lowercase());
                 std::thread::spawn(move || twitch_watcher(app2, gen, l));
@@ -1451,7 +1628,7 @@ fn chat_join(
         }
         Platform::Kick => {
             match kick_chatroom {
-                Some(room) => kick::spawn_chat(kick_channel_id, room, tx),
+                Some(room) => kick::spawn_chat(kick_channel_id, room, tx, move || gen_alive(gen), history),
                 None => {
                     let _ = tx.send(ChatMsg::system("Chat is unavailable for this channel."));
                 }
@@ -1512,24 +1689,11 @@ async fn chat_send(platform: Platform, text: String, reply_to: Option<String>, r
             }
         }
         Platform::Kick => {
-            let (a, id, secret) = {
-                let c = cfg();
-                (c.kick.clone().ok_or("Sign in to Kick to chat.")?, c.kick_client_id.clone(), c.kick_client_secret.clone())
-            };
-            if a.web {
-                let room = CHAT_KICK_ROOM.lock().unwrap().ok_or("Channel info is still loading.")?;
-                return blocking(move || {
-                    let reply = reply_to.as_deref().map(|id| (id, reply_name.as_deref().unwrap_or(""), reply_text.as_deref().unwrap_or("")));
-                    kick::send_message(&a.token, room, &text, reply).map_err(|e| format!("Kick didn't send your message: {e}"))
-                })
-                .await;
-            }
-            let uid = CHAT_KICK_UID.lock().unwrap().ok_or("Channel info is still loading.")?;
+            let a = cfg().kick.clone().filter(|a| a.web).ok_or("Sign in to Kick to chat.")?;
+            let room = CHAT_KICK_ROOM.lock().unwrap().ok_or("Channel info is still loading.")?;
             blocking(move || {
-                let a2 = auth::kick_restore(&a, &id, &secret).unwrap_or(a);
-                cfg().kick = Some(a2.clone());
-                save();
-                auth::kick_send(&a2.token, uid, &text, reply_to.as_deref())
+                let reply = reply_to.as_deref().map(|id| (id, reply_name.as_deref().unwrap_or(""), reply_text.as_deref().unwrap_or("")));
+                kick::send_message(&a.token, room, &text, reply).map_err(|e| format!("Kick didn't send your message: {e}"))
             })
             .await
         }
@@ -1539,7 +1703,7 @@ async fn chat_send(platform: Platform, text: String, reply_to: Option<String>, r
 /// `duostream twitch:name` / `duostream kick:name` / a channel URL opens it on launch.
 #[tauri::command]
 fn startup_arg() -> Option<String> {
-    std::env::args().nth(1)
+    std::env::args().skip(1).find(|a| !a.starts_with("--"))
 }
 
 /// Debug builds only: DUOSTREAM_PREVIEW=1 skips the sign-in gate for testing.
@@ -1549,9 +1713,9 @@ fn preview_mode() -> bool {
 }
 
 #[tauri::command]
-fn ad_status() -> serde_json::Value {
+fn ad_status(login: Option<String>) -> serde_json::Value {
     json!({
-        "ad_break": adblock::AD_BREAK.load(Ordering::Relaxed),
+        "ad_break": adblock::ad_break(login.as_deref()),
         "ads_blocked": adblock::ADS_BLOCKED.load(Ordering::Relaxed),
     })
 }
@@ -1605,7 +1769,7 @@ fn log_line(msg: &str) {
 
 #[tauri::command]
 fn open_external(url: String) {
-    if url.starts_with("https://") {
+    if (url.starts_with("https://") || url.starts_with("http://")) && !url.contains(char::is_whitespace) {
         auth::open_browser(&url);
     }
 }
@@ -1649,6 +1813,8 @@ fn app_version(app: AppHandle) -> String {
 
 /// Windows labels toasts by AppUserModelID. Register ours (name + icon) so notifications say
 /// "duostream" instead of borrowing PowerShell's, even when the app wasn't installed.
+const APP_ID: &str = "com.duostream.app";
+
 fn register_notification_identity(identifier: &str) {
     use std::os::windows::process::CommandExt;
     let Some(dir) = std::env::var_os("APPDATA").map(|d| std::path::PathBuf::from(d).join("duostream")) else { return };
@@ -1673,7 +1839,7 @@ fn main() {
             let _ = std::fs::write(p.join("crash.log"), msg);
         }
     }));
-    register_notification_identity("com.duostream.app");
+    register_notification_identity(APP_ID);
     {
         let saved = cfg().twitch_integrity.clone();
         if !saved.is_null() {
@@ -1681,12 +1847,28 @@ fn main() {
         }
     }
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // A second launch (desktop shortcut, `duostream.exe twitch:name`): show this window instead.
+            show_main(app);
+            if let Some(arg) = argv.get(1).filter(|a| !a.is_empty()) {
+                let _ = app.emit("open-arg", arg.clone());
+            }
+        }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
             seed_builtin_plugins(app);
+            if cfg().autostart {
+                let _ = autostart_registry(true); // the exe may have moved (update / reinstall)
+            }
+            if !std::env::args().any(|a| a == "--tray") {
+                use tauri::Manager;
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                }
+            }
             let open = MenuItem::with_id(app, "open", "Open duostream", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &quit])?;
@@ -1709,22 +1891,27 @@ fn main() {
             std::thread::spawn(move || live_notifier(handle));
             let handle = app.handle().clone();
             std::thread::spawn(move || drops_claimer(handle));
+            std::thread::spawn(token_keeper);
             Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" && cfg().close_to_tray {
-                    api.prevent_close();
-                    let _ = window.hide();
-                    let _ = window.emit("window-hidden", ());
+                if window.label() == "main" {
+                    if cfg().close_to_tray {
+                        api.prevent_close();
+                        let _ = window.hide();
+                        let _ = window.emit("window-hidden", ());
+                    } else {
+                        tauri::Manager::app_handle(window).exit(0); // pop-out chat / PiP would otherwise be left without the app
+                    }
                 }
             }
         })
         .invoke_handler(tauri::generate_handler![
+            tray_sleep,
             get_state,
             set_prefs,
             restore_sessions,
-            browse,
             follows_status,
             resolve,
             play_url,
@@ -1732,7 +1919,6 @@ fn main() {
             set_follow,
             twitch_login_start,
             login_cancel,
-            kick_login,
             sign_out,
             chat_join,
             chat_send,
@@ -1779,7 +1965,11 @@ fn main() {
             drops_connect,
             drops_disconnect,
             drops_status,
-            drops_claim
+            drops_claim,
+            set_notify,
+            twitch_link,
+            set_autostart,
+            user_id
         ])
         .run(tauri::generate_context!())
         .expect("failed to start duostream");

@@ -1,16 +1,13 @@
 //! Account sign-in.
 //! Twitch: OAuth device-code flow (enter a code at twitch.tv/activate). No secrets needed.
-//! Kick: official OAuth 2.1 + PKCE against id.kick.com using the user's own Kick developer app.
+//! Kick: the kick.com website session from the in-app login window (see drops_connect in main.rs).
 use crate::common::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
 pub const TWITCH_CLIENT_ID: &str = "ue6666qo983tsx6so1t0vnawi233wa";
 const TWITCH_SCOPES: &str = "chat:read chat:edit user:read:follows";
-pub const KICK_REDIRECT: &str = "http://localhost:53682/callback";
-const KICK_SCOPES: &str = "user:read channel:read chat:write";
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct TwitchAuth {
@@ -28,7 +25,8 @@ pub struct KickAuth {
     pub username: String,
     pub avatar: Option<String>,
     pub expires_at: i64,
-    /// Signed in through kick.com itself (token = website session) instead of a developer app.
+    /// Signed in through kick.com itself (token = website session). False = the old developer-app
+    /// sign-in from before v0.7, which is no longer supported (restore asks to sign in again).
     #[serde(default)]
     pub web: bool,
 }
@@ -36,10 +34,6 @@ pub struct KickAuth {
 pub fn open_browser(url: &str) {
     use std::os::windows::process::CommandExt;
     let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).creation_flags(0x0800_0000).spawn();
-}
-
-fn now() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 fn form(url: &str, pairs: &[(&str, &str)]) -> Result<Value, String> {
@@ -129,6 +123,28 @@ pub fn twitch_restore(a: &TwitchAuth) -> Result<TwitchAuth, String> {
     twitch_identify(token, refresh)
 }
 
+/// Called every few minutes while running: Some(new session) when the token was refreshed because it
+/// expires within 30 minutes or was already rejected; None when it is still good.
+pub fn twitch_keep_fresh(a: &TwitchAuth) -> Result<Option<TwitchAuth>, String> {
+    let still_good = http()
+        .get("https://id.twitch.tv/oauth2/validate")
+        .set("Authorization", &format!("OAuth {}", a.token))
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<Value>().ok())
+        .is_some_and(|v| v["expires_in"].as_u64().is_none_or(|s| s == 0 || s > 1800)); // 0 = never expires
+    if still_good {
+        return Ok(None);
+    }
+    let v = form(
+        "https://id.twitch.tv/oauth2/token",
+        &[("client_id", TWITCH_CLIENT_ID), ("grant_type", "refresh_token"), ("refresh_token", &a.refresh)],
+    )?;
+    let token = v["access_token"].as_str().ok_or("refresh failed")?.to_string();
+    let refresh = v["refresh_token"].as_str().unwrap_or(&a.refresh).to_string();
+    twitch_identify(token, refresh).map(Some)
+}
+
 fn helix(token: &str, url: &str) -> Result<Value, String> {
     http()
         .get(url)
@@ -144,7 +160,7 @@ fn helix(token: &str, url: &str) -> Result<Value, String> {
 pub fn twitch_follows(a: &TwitchAuth) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut cursor = String::new();
-    for _ in 0..20 {
+    for _ in 0..200 {
         let mut url = format!("https://api.twitch.tv/helix/channels/followed?user_id={}&first=100", a.user_id);
         if !cursor.is_empty() {
             url.push_str(&format!("&after={cursor}"));
@@ -165,136 +181,11 @@ pub fn twitch_follows(a: &TwitchAuth) -> Result<Vec<String>, String> {
 
 // ------------------------------------------------------------------ Kick
 
-fn pkce() -> (String, String) {
-    use base64::Engine;
-    use rand::RngCore;
-    use sha2::Digest;
-    let mut buf = [0u8; 48];
-    rand::thread_rng().fill_bytes(&mut buf);
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let verifier = b64.encode(buf);
-    let challenge = b64.encode(sha2::Sha256::digest(verifier.as_bytes()));
-    (verifier, challenge)
-}
-
-/// Opens the browser to Kick's consent page and waits for the redirect on localhost.
-pub fn kick_login(client_id: &str, client_secret: &str, cancel: &std::sync::atomic::AtomicBool) -> Result<KickAuth, String> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:53682").map_err(|e| format!("port 53682 busy: {e}"))?;
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let (verifier, challenge) = pkce();
-    let state = pkce().0[..16].to_string();
-    let url = format!(
-        "https://id.kick.com/oauth/authorize?client_id={}&response_type=code&redirect_uri={}&state={}&scope={}&code_challenge={}&code_challenge_method=S256",
-        enc(client_id),
-        enc(KICK_REDIRECT),
-        state,
-        enc(KICK_SCOPES),
-        challenge
-    );
-    open_browser(&url);
-
-    let deadline = Instant::now() + Duration::from_secs(300);
-    let code = loop {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err("cancelled".into());
-        }
-        if Instant::now() > deadline {
-            return Err("Kick sign-in timed out".into());
-        }
-        let Ok((mut stream, _)) = listener.accept() else {
-            std::thread::sleep(Duration::from_millis(150));
-            continue;
-        };
-        let _ = stream.set_nonblocking(false);
-        let mut line = String::new();
-        let _ = BufReader::new(&stream).read_line(&mut line);
-        let path = line.split_whitespace().nth(1).unwrap_or("");
-        let q = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-        let get = |k: &str| q.split('&').find_map(|kv| kv.strip_prefix(k).and_then(|v| v.strip_prefix('='))).map(String::from);
-        let page = |msg: &str| {
-            format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<html><body style=\"background:#0b0e0f;color:#eee;font:16px Segoe UI;display:grid;place-items:center;height:100vh;margin:0\"><div>{msg}</div></body></html>")
-        };
-        if !path.starts_with("/callback") {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
-            continue;
-        }
-        if let Some(e) = get("error") {
-            let _ = stream.write_all(page("Kick sign-in was cancelled. You can close this tab.").as_bytes());
-            return Err(format!("Kick sign-in failed: {e}"));
-        }
-        if get("state").as_deref() != Some(state.as_str()) {
-            let _ = stream.write_all(page("Sign-in state mismatch. Please try again.").as_bytes());
-            return Err("Kick sign-in state mismatch".into());
-        }
-        let _ = stream.write_all(page("Signed in to Kick. You can close this tab and return to duostream.").as_bytes());
-        break get("code").ok_or("Kick returned no code")?;
-    };
-
-    let v = form(
-        "https://id.kick.com/oauth/token",
-        &[
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-            ("redirect_uri", KICK_REDIRECT),
-            ("code_verifier", &verifier),
-        ],
-    )
-    .map_err(|e| format!("Kick token exchange failed: {e}"))?;
-    kick_finish(&v, None)
-}
-
-fn kick_finish(v: &Value, old_refresh: Option<&str>) -> Result<KickAuth, String> {
-    let token = v["access_token"].as_str().ok_or("Kick returned no token")?.to_string();
-    let refresh = v["refresh_token"].as_str().or(old_refresh).unwrap_or("").to_string();
-    let expires_at = now() + v["expires_in"].as_i64().unwrap_or(3600);
-    let u: Value = http()
-        .get("https://api.kick.com/public/v1/users")
-        .set("Authorization", &format!("Bearer {token}"))
-        .call()
-        .map_err(err_str)?
-        .into_json()
-        .map_err(|e| e.to_string())?;
-    let me = &u["data"][0];
-    Ok(KickAuth {
-        token,
-        refresh,
-        username: me["name"].as_str().unwrap_or("kick user").to_string(),
-        avatar: me["profile_picture"].as_str().filter(|s| !s.is_empty()).map(String::from),
-        expires_at,
-        web: false,
-    })
-}
-
-pub fn kick_restore(a: &KickAuth, client_id: &str, client_secret: &str) -> Result<KickAuth, String> {
-    if a.web {
-        // website session: still valid if kick.com still knows who we are
-        let (username, avatar) = crate::kick::me(&a.token)?;
-        return Ok(KickAuth { username, avatar: avatar.or(a.avatar.clone()), ..a.clone() });
+/// Check a saved kick.com website session (and pick up a changed name/avatar).
+pub fn kick_restore(a: &KickAuth) -> Result<KickAuth, String> {
+    if !a.web {
+        return Err("old Kick sign-in".into());
     }
-    if a.expires_at > now() + 120 {
-        return Ok(a.clone());
-    }
-    let v = form(
-        "https://id.kick.com/oauth/token",
-        &[("grant_type", "refresh_token"), ("refresh_token", &a.refresh), ("client_id", client_id), ("client_secret", client_secret)],
-    )?;
-    kick_finish(&v, Some(&a.refresh))
-}
-
-pub fn kick_send(token: &str, broadcaster_user_id: u64, content: &str, reply_to: Option<&str>) -> Result<(), String> {
-    let mut body = serde_json::json!({ "type": "user", "broadcaster_user_id": broadcaster_user_id, "content": content });
-    if let Some(id) = reply_to {
-        body["reply_to_message_id"] = serde_json::json!(id);
-    }
-    http()
-        .post("https://api.kick.com/public/v1/chat")
-        .set("Authorization", &format!("Bearer {token}"))
-        .send_json(body)
-        .map(|_| ())
-        .map_err(|e| match e {
-            ureq::Error::Status(c, r) => format!("Kick chat error {c}: {}", r.into_string().unwrap_or_default()),
-            e => err_str(e),
-        })
+    let (username, avatar) = crate::kick::me(&a.token)?;
+    Ok(KickAuth { username, avatar: avatar.or(a.avatar.clone()), ..a.clone() })
 }

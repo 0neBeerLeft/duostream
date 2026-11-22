@@ -3,9 +3,12 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const appWindow = window.__TAURI__.window.getCurrentWindow();
-const APP_VERSION = "0.6.0";
+let APP_VERSION = ""; // set at boot from the backend (Cargo.toml is the one place the version lives)
+const playSafe = (v) => v?.play().catch(() => {}); // play() rejects when a newer load interrupts it: harmless
 window.addEventListener("error", (e) => invoke("js_log", { msg: `${new Date().toISOString()} ${e.message} @ ${e.filename}:${e.lineno}:${e.colno}` }).catch(() => {}));
-window.addEventListener("unhandledrejection", (e) => invoke("js_log", { msg: `${new Date().toISOString()} unhandled: ${e.reason?.stack || e.reason}` }).catch(() => {}));
+// anything the content security policy blocks ends up in ui.log (release builds have no devtools)
+document.addEventListener("securitypolicyviolation", (e) => invoke("js_log", { msg: `${new Date().toISOString()} CSP blocked ${e.effectiveDirective}: ${e.blockedURI || "inline"} @ ${e.sourceFile || ""}:${e.lineNumber || 0}` }).catch(() => {}));
+window.addEventListener("unhandledrejection",(e) => invoke("js_log", { msg: `${new Date().toISOString()} unhandled: ${e.reason?.stack || e.reason}` }).catch(() => {}));
 
 // ------------------------------------------------------------------ helpers
 const $ = (s, r = document) => r.querySelector(s);
@@ -46,6 +49,7 @@ const I = {
   close: svg('<path d="M18 6 6 18M6 6l12 12"/>'),
   refresh: svg('<path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/>'),
   bell: svg('<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.9 1.9 0 0 0 3.4 0"/>'),
+  bellOff: svg('<path d="M8.7 3.4A6 6 0 0 1 18 8c0 3 .6 5.1 1.3 6.5M17 17H3s3-2 3-9c0-.6.1-1.2.3-1.8M10.3 21a1.9 1.9 0 0 0 3.4 0M3 3l18 18"/>'),
   folder: svg('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
   trash: svg('<path d="M4 7h16M10 11v6M14 11v6M5 7l1 13a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1l1-13M9 7V4h6v3"/>'),
   sliders: svg('<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>'),
@@ -65,6 +69,9 @@ const I = {
   link: svg('<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>'),
   scissors: svg('<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.1 15.9M14.5 14.5 20 20M8.1 8.1 12 12"/>'),
   pip: svg('<rect x="2" y="4" width="20" height="16" rx="2"/><rect x="12" y="11" width="8" height="7" rx="1" fill="currentColor"/>'),
+  headphones: svg('<path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1v-6h3zM3 19a2 2 0 0 0 2 2h1v-6H3z"/>'),
+  moon: svg('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>'),
+  raid: svg('<path d="M5 12h14M13 6l6 6-6 6"/><path d="M5 6v12"/>'),
 };
 
 // Platform marks (Twitch glitch, Kick K) shown on avatars, tags and account rows.
@@ -78,10 +85,16 @@ const ptag = (p) => `<span class="tag ptag ${p === "Twitch" ? "t" : "k"}">${PICO
 function avatar(platform, url, name, cls = "", ring = false) {
   const letter = esc((name || "?").slice(0, 1).toUpperCase());
   const img = url
-    ? `<img src="${esc(url)}" alt="" loading="lazy" onerror="this.outerHTML='<div class=&quot;ph&quot;>${letter}</div>'">`
+    ? `<img src="${esc(url)}" alt="" loading="lazy" data-letter="${letter}">`
     : `<div class="ph">${letter}</div>`;
   return `<div class="avatar ${cls} ${ring ? "live-ring" : ""}">${img}${pbadge(platform)}</div>`;
 }
+
+// broken avatar image -> letter placeholder (capture phase: image errors don't bubble)
+document.addEventListener("error", (e) => {
+  const img = e.target;
+  if (img?.tagName === "IMG" && img.dataset.letter !== undefined) { const ph = document.createElement("div"); ph.className = "ph"; ph.textContent = img.dataset.letter; img.replaceWith(ph); }
+}, true);
 
 // per-channel memory: volume + quality
 const chPrefKey = (ch) => `chp:${akey(ch.platform, ch.login)}`;
@@ -126,7 +139,7 @@ function toast(msg) {
 const S = {
   st: null, // backend AppState
   view: "following",
-  browse: { cards: [], loading: false, error: null, at: 0, tab: "foryou", more: false, loadingMore: false, twitchCursor: null, kickPage: null,
+  browse: { cards: [], loading: false, error: null, at: 0, tab: "foryou", more: false, loadingMore: false, twitchCursor: null, kickCursor: null,
     f: { platform: "all", sort: "viewers", language: "", tag: "", drops: false } },
   forYou: { at: 0, sections: null },
   following: { tab: "live" },
@@ -158,83 +171,143 @@ const S = {
 const signedIn = () => !!(S.st && (S.st.twitch || S.st.kick || S.preview));
 const isFollowed = (p, l) => S.st.follows.some((f) => f.platform === p && f.login === l);
 
-// ================================================================== plugin host
-// Plugins are plain JS run with an `api` object. See PLUGINS.md for the full reference.
+/// ================================================================== plugin host
+// Each plugin runs sandboxed in its own Web Worker (ui/plugin-worker.js + the plugin's code): no DOM, no
+// Tauri access. It talks to this host by messages; the host renders its UI and answers what the api allows.
+// See PLUGINS.md for the plugin-side reference.
+const PLUGIN_CHAT_TIMEOUT = 250; // ms a plugin gets per chat batch before messages pass through unchanged
+
+/** Plugin-supplied icon: the app's own icons render as-is; any other SVG is drawn as a CSS mask (can't run code). */
+function pluginIcon(icon) {
+  if (icon && Object.values(I).includes(icon)) return icon;
+  if (typeof icon === "string" && /^\s*<svg[\s>]/i.test(icon) && icon.length < 20000) {
+    const url = `url("data:image/svg+xml,${encodeURIComponent(icon)}")`;
+    return `<span class="picon-mask" style="${esc(`--m:${url}`)}"></span>`;
+  }
+  return I.puzzle;
+}
+
 const Plugins = {
   installed: [], // { manifest, code, enabled } from the backend
-  loaded: new Map(), // id -> { api, unload: [], hooks: {event: [fn]} }
-  ui: { nav: [], player: [], badges: [] },
+  loaded: new Map(), // id -> { worker, manifest, hooks: Set, ready, chatWaits: Map }
+  ui: { nav: [], player: [], badges: [] }, // { owner, id, icon, title, active, text, visible }
+  boot: null,
+  rid: 0,
+  emotes: new Map(), // plugin id -> { group, list: [{ name, url }] } for the emote picker
 
-  emit(event, payload) {
-    for (const [id, p] of this.loaded) for (const fn of p.hooks[event] || []) {
-      try { fn(payload); } catch (e) { console.error(`[plugin ${id}]`, e); }
-    }
-  },
-  /** chat:message hooks may return false (hide) or a changed message object. */
-  filterChat(m) {
-    for (const [id, p] of this.loaded) for (const fn of p.hooks["chat:message"] || []) {
-      try { const r = fn(m); if (r === false) return null; if (r && typeof r === "object") m = r; } catch (e) { console.error(`[plugin ${id}]`, e); }
-    }
-    return m;
-  },
-
-  makeApi(manifest) {
-    const id = manifest.id;
-    const rec = { hooks: {}, unload: [] };
-    const own = (list, item) => { item.owner = id; list.push(item); return item; };
-    const api = {
-      id, manifest, appVersion: APP_VERSION, icons: I,
-      on(event, fn) { (rec.hooks[event] ||= []).push(fn); },
-      onUnload(fn) { rec.unload.push(fn); },
-      toast,
-      addStyle(css) { const s = document.createElement("style"); s.dataset.plugin = id; s.textContent = css; document.head.appendChild(s); rec.unload.push(() => s.remove()); return s; },
-      addNavButton(opts) {
-        const item = own(Plugins.ui.nav, { ...opts });
-        renderNav();
-        return { update(o) { Object.assign(item, o); renderNav(); }, remove() { Plugins.ui.nav = Plugins.ui.nav.filter((x) => x !== item); renderNav(); } };
-      },
-      addPlayerButton(opts) {
-        const item = own(Plugins.ui.player, { ...opts });
-        renderPlayerExtras();
-        return { update(o) { Object.assign(item, o); renderPlayerExtras(); }, remove() { Plugins.ui.player = Plugins.ui.player.filter((x) => x !== item); renderPlayerExtras(); } };
-      },
-      addPlayerBadge(text) {
-        const item = own(Plugins.ui.badges, { text, visible: false });
-        return { show(v = true) { item.visible = v; renderPlayerExtras(); }, setText(t) { item.text = t; renderPlayerExtras(); }, remove() { Plugins.ui.badges = Plugins.ui.badges.filter((x) => x !== item); renderPlayerExtras(); } };
-      },
-      storage: {
-        get(key, def) { try { const v = localStorage.getItem(`plugin:${id}:${key}`); return v === null ? def : JSON.parse(v); } catch { return def; } },
-        set(key, val) { try { localStorage.setItem(`plugin:${id}:${key}`, JSON.stringify(val)); } catch {} },
-      },
-      channel() { return S.ch ? { platform: S.ch.platform, login: S.ch.login, display: S.ch.info.display, title: S.ch.info.title, category: S.ch.info.category, live: S.ch.info.live, viewers: S.ch.info.viewers } : null; },
-      view() { return S.view; },
-      me() { return { twitch: S.st.twitch?.name || null, kick: S.st.kick?.name || null }; },
-      openChannel(platform, login) { openChannel(platform, login); },
-      reloadPlayer() { if (S.ch?.info.live) startPlayback(); },
-      adStatus() { return invoke("ad_status"); },
+  state() {
+    return {
+      channel: S.ch ? { platform: S.ch.platform, login: S.ch.login, userId: S.ch.info.user_id || null, display: S.ch.info.display, title: S.ch.info.title, category: S.ch.info.category, live: S.ch.info.live, viewers: S.ch.info.viewers } : null,
+      view: S.view,
+      me: { twitch: S.st?.twitch?.name || null, kick: S.st?.kick?.name || null },
     };
-    return { api, rec };
+  },
+  emit(event, payload) {
+    const state = this.state();
+    for (const p of this.loaded.values()) if (p.hooks.has(event)) p.worker.postMessage({ t: "event", event, payload, state });
+  },
+  /** Run a batch of chat messages through every plugin with a chat:message hook (in load order). */
+  async filterChat(list) {
+    let cur = list;
+    for (const p of this.loaded.values()) {
+      if (!p.hooks.has("chat:message") || !cur.length) continue;
+      const rid = ++this.rid;
+      const sent = cur;
+      const out = await new Promise((resolve) => {
+        const timer = setTimeout(() => { p.chatWaits.delete(rid); resolve(null); }, PLUGIN_CHAT_TIMEOUT);
+        p.chatWaits.set(rid, (v) => { clearTimeout(timer); resolve(v); });
+        try { p.worker.postMessage({ t: "chat", rid, msgs: sent, state: this.state() }); } catch { clearTimeout(timer); p.chatWaits.delete(rid); resolve(null); }
+      });
+      if (!Array.isArray(out) || out.length !== sent.length) continue; // slow or broken plugin: messages pass through
+      // plugins may change a message, but not its system flag or the Chat Enhancer's decisions
+      cur = out.map((m, i) => (m === null ? null : m && typeof m === "object" ? { ...m, system: sent[i].system, ce: sent[i].ce } : sent[i])).filter(Boolean);
+    }
+    return cur;
   },
 
-  load(p) {
+  onMessage(id, m) {
+    const p = this.loaded.get(id);
+    if (!p || !m || typeof m !== "object") return;
+    switch (m.t) {
+      case "ready": p.ready = true; break;
+      case "hook": p.hooks.add(String(m.event)); break;
+      case "toast": toast(String(m.text || "")); break;
+      case "style": {
+        const s = document.createElement("style");
+        s.dataset.plugin = id; s.dataset.sid = String(m.id);
+        s.textContent = String(m.css || "");
+        document.head.appendChild(s);
+        break;
+      }
+      case "style-rm": $$(`style[data-plugin="${CSS.escape(id)}"]`).filter((s) => s.dataset.sid === String(m.id)).forEach((s) => s.remove()); break;
+      case "ui": case "ui-rm": {
+        const list = this.ui[m.kind]; if (!list) break;
+        const i = list.findIndex((x) => x.owner === id && x.id === m.id);
+        if (m.t === "ui-rm") { if (i >= 0) list.splice(i, 1); }
+        else {
+          const pr = m.props || {};
+          const item = { owner: id, id: m.id, icon: String(pr.icon || ""), title: String(pr.title || ""), active: !!pr.active, text: String(pr.text || ""), visible: !!pr.visible };
+          if (i >= 0) list[i] = item; else list.push(item);
+        }
+        if (m.kind === "nav") renderNav(); else renderPlayerExtras();
+        break;
+      }
+      case "store": try { localStorage.setItem(`plugin:${id}:${m.key}`, JSON.stringify(m.value)); } catch {} break;
+      case "open": if ((m.platform === "Twitch" || m.platform === "Kick") && /^[\w-]{1,60}$/.test(m.login || "")) openChannel(m.platform, m.login); break;
+      case "reload": if (S.ch?.info.live && !S.ch.vod) startPlayback(); break;
+      case "req":
+        if (m.what === "adStatus") invoke("ad_status", { login: S.ch?.login || null }).then((value) => p.worker.postMessage({ t: "reply", rid: m.rid, value })).catch(() => {});
+        break;
+      case "chat-res": { const w = p.chatWaits.get(m.rid); p.chatWaits.delete(m.rid); w?.(m.out); break; }
+      case "emotes": {
+        const list = (Array.isArray(m.list) ? m.list : []).filter((e) => typeof e?.name === "string" && typeof e?.url === "string" && e.url.startsWith("https://")).slice(0, 5000);
+        if (list.length) this.emotes.set(id, { group: p.manifest.name, list }); else this.emotes.delete(id);
+        if (list.length && S.chatRaw.length) rerenderChat(); // messages that came in before the emotes loaded
+        break;
+      }
+    }
+  },
+
+  /** Clicks on plugin buttons are forwarded to the owning worker. */
+  click(item) { if (item) this.loaded.get(item.owner)?.worker.postMessage({ t: "click", id: item.id, state: this.state() }); },
+
+  async load(p) {
     const m = p.manifest;
     if (this.loaded.has(m.id)) return;
-    const { api, rec } = this.makeApi(m);
-    this.loaded.set(m.id, rec);
+    this.boot ||= await (await fetch("plugin-worker.js")).text();
+    if (this.loaded.has(m.id)) return;
+    const storage = {};
     try {
-      new Function("api", `"use strict";\n${p.code}\n//# sourceURL=plugin-${m.id}.js`)(api);
-    } catch (e) {
-      console.error(e);
-      toast(`Plugin "${m.name}" failed to start: ${e.message}`);
-      this.unload(m.id);
-    }
+      const pre = `plugin:${m.id}:`;
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k?.startsWith(pre)) try { storage[k.slice(pre.length)] = JSON.parse(localStorage.getItem(k)); } catch {}
+      }
+    } catch {}
+    const init = { manifest: m, appVersion: APP_VERSION, icons: I, storage, state: this.state() };
+    const src = `const __INIT = ${JSON.stringify(init)};\n${this.boot}\n;(function (api) { "use strict";\n${p.code}\n})(api);\npostMessage({ t: "ready" });\n//# sourceURL=plugin-${m.id}.js`;
+    const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
+    const worker = new Worker(url, { name: `plugin-${m.id}` });
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    const rec = { worker, manifest: m, hooks: new Set(), ready: false, chatWaits: new Map() };
+    this.loaded.set(m.id, rec);
+    worker.onmessage = (e) => this.onMessage(m.id, e.data);
+    worker.onerror = (e) => {
+      e.preventDefault?.();
+      invoke("js_log", { msg: `[plugin ${m.id}] ${e.message} @${e.lineno}` }).catch(() => {});
+      if (!rec.ready) { toast(`Plugin "${m.name}" failed to start: ${e.message}`); this.unload(m.id); }
+    };
   },
 
   unload(id) {
     const rec = this.loaded.get(id);
     if (!rec) return;
-    for (const fn of rec.unload) { try { fn(); } catch (e) { console.error(e); } }
     this.loaded.delete(id);
+    try { rec.worker.postMessage({ t: "unload" }); } catch {}
+    setTimeout(() => rec.worker.terminate(), 100); // let its onUnload hooks run first
+    for (const w of rec.chatWaits.values()) w(null);
+    $$(`style[data-plugin="${CSS.escape(id)}"]`).forEach((s) => s.remove());
+    this.emotes.delete(id);
     for (const k of Object.keys(this.ui)) this.ui[k] = this.ui[k].filter((x) => x.owner !== id);
     renderNav();
     renderPlayerExtras();
@@ -243,7 +316,7 @@ const Plugins = {
   async refresh() {
     this.installed = await invoke("plugins_list");
     for (const p of this.installed) {
-      if (p.enabled && !this.loaded.has(p.manifest.id)) this.load(p);
+      if (p.enabled && !this.loaded.has(p.manifest.id)) await this.load(p).catch((e) => toast(`Plugin "${p.manifest.name}" failed to start: ${e.message || e}`));
       if (!p.enabled && this.loaded.has(p.manifest.id)) this.unload(p.manifest.id);
     }
     for (const id of [...this.loaded.keys()]) if (!this.installed.some((p) => p.manifest.id === id)) this.unload(id);
@@ -300,16 +373,6 @@ async function onProviderAction(act, btn) {
       S.kickBusy = true;
     } else if (act === "kick-cancel") {
       S.kickBusy = false;
-    } else if (act === "kick-login") {
-      const clientId = $("#kickId").value.trim();
-      const secretInput = $("#kickSecret").value.trim();
-      S.kickBusy = true;
-      rerenderAuth();
-      try {
-        toast(await invoke("kick_login", { clientId, clientSecret: secretInput || (S.st.has_kick_secret ? "__keep__" : "") }));
-      } finally {
-        S.kickBusy = false;
-      }
     } else if (act === "signout") {
       await invoke("sign_out", { platform: btn.dataset.p });
     } else if (act === "enter") {
@@ -337,7 +400,7 @@ function renderNav() {
   const r = $("#navRight");
   const accts = [["Twitch", S.st.twitch], ["Kick", S.st.kick]].filter(([, a]) => a);
   r.innerHTML = `
-    ${Plugins.ui.nav.map((b, i) => `<button class="icon-btn plugin-btn ${b.active ? "on" : ""}" data-pnav="${i}" title="${esc(b.title || "")}">${b.icon || I.puzzle}</button>`).join("")}
+    ${Plugins.ui.nav.map((b, i) => `<button class="icon-btn plugin-btn ${b.active ? "on" : ""}" data-pnav="${i}" title="${esc(b.title || "")}">${pluginIcon(b.icon)}</button>`).join("")}
     <button class="icon-btn" data-view-btn="plugins" title="Plugins">${I.puzzle}</button>
     ${accts.length < 2 ? '<button class="btn secondary sm" data-view-btn="accounts">Add account</button>' : ""}
     ${accts.map(([p, a]) => `<button class="nav-avatar" data-acct="${p}" title="${esc(a.name)} on ${p}">${avatar(p, a.avatar, a.name)}</button>`).join("")}`;
@@ -431,8 +494,22 @@ async function doSearch(q) {
   if (!q) return;
   const low = q.toLowerCase();
   const pick = (marker, p) => { const i = low.indexOf(marker); if (i < 0) return null; const name = q.slice(i + marker.length).split(/[/?#]/)[0]; return name ? [p, name] : null; };
-  const link = pick("twitch.tv/", "Twitch") || pick("kick.com/", "Kick");
   const input = $("#searchInput");
+  // twitch.tv/videos/<id>, twitch.tv/<channel>/clip/<slug>, clips.twitch.tv/<slug>
+  const vod = /twitch\.tv\/videos\/(\d+)/i.exec(q), clip = /(?:clips\.twitch\.tv\/|twitch\.tv\/[\w-]+\/clip\/)([\w-]+)/i.exec(q);
+  if (vod || clip) {
+    input.value = ""; input.blur();
+    try {
+      const kind = vod ? "video" : "clip", id = (vod || clip)[1];
+      const o = await invoke("twitch_link", { kind, id });
+      await openChannel("Twitch", o.login);
+      playVideo({ id, title: o.title }, vod ? "videos" : "clips");
+    } catch (e) { toast(String(e)); }
+    return;
+  }
+  const RESERVED = ["directory", "videos", "settings", "search", "downloads", "p", "jobs", "turbo", "subscriptions", "inventory", "drops", "categories", "following", "browse"];
+  let link = pick("twitch.tv/", "Twitch") || pick("kick.com/", "Kick");
+  if (link && RESERVED.includes(link[1].toLowerCase())) link = null; // not a channel page
   input.value = "";
   input.blur();
   if (link) return openChannel(link[0], link[1]);
@@ -571,8 +648,9 @@ const skeletons = (n) => Array.from({ length: n }, () => `<div class="card skele
 function renderMain() {
   renderNav();
   const main = $("#main");
-  $("#chat").classList.toggle("hidden", S.view !== "channel" || !S.st.show_chat || S.popped);
+  $("#chat").classList.toggle("hidden", !(S.view === "channel" || (S.view === "multi" && S.ch?.multi)) || !S.st.show_chat || S.popped);
   if (S.view === "channel") return; // channel page manages its own DOM
+  if (S.view === "multi") { document.body.classList.remove("theater"); mvRender(); return; }
   document.body.classList.remove("theater");
   if (S.view === "following") {
     const rows = sidebarRows();
@@ -649,6 +727,7 @@ function renderMain() {
         <button class="icon-btn" id="refreshBrowse" title="Refresh">${I.refresh}</button>
       </div>
       ${f.drops && f.platform !== "Twitch" ? '<p class="hint" style="margin:-6px 0 12px">Drops filter shows Twitch streams only.</p>' : ""}
+      ${!f.drops && f.platform !== "Twitch" && f.sort !== "viewers" ? '<p class="hint" style="margin:-6px 0 12px">Kick only lists streams by most viewers, so this sort shows Twitch streams only.</p>' : ""}
       ${b.error && !b.cards.length ? `<div class="error-box">${esc(b.error)}</div>` : ""}
       <div class="grid" id="browseGrid">${b.loading && !b.cards.length ? skeletons(12) : cards.map(cardHTML).join("")}</div>
       ${!b.loading && !cards.length && !b.error ? '<div class="empty"><h2>No streams match these filters</h2></div>' : ""}
@@ -665,6 +744,8 @@ function renderMain() {
       ${updateRowHTML()}
       <div class="setting"><div><b>Go-live notifications</b><p>Get a Windows notification when a channel you follow goes live.</p></div><button class="switch ${S.st.notify_live ? "on" : ""}" data-pref="notifyLive"></button></div>
       <div class="setting"><div><b>Keep running in the tray</b><p>Closing the window keeps duostream in the system tray so notifications keep working.</p></div><button class="switch ${S.st.close_to_tray ? "on" : ""}" data-pref="closeToTray"></button></div>
+      <div class="setting"><div><b>Follow raids</b><p>When the streamer you're watching raids another channel, go along after a short countdown (you can stay).</p></div><button class="switch ${followRaids() ? "on" : ""}" id="raidSw"></button></div>
+      <div class="setting"><div><b>Start with Windows</b><p>Starts quietly in the tray when you sign in to Windows, so go-live notifications work without opening the app.</p></div><button class="switch ${S.st.autostart ? "on" : ""}" id="autostartSw"></button></div>
       <div class="setting"><div><b>Auto-claim rewards</b><p>Claim channel point bonuses and finished drops automatically.</p></div><button class="switch ${S.st.auto_claim ? "on" : ""}" data-pref="autoClaim"></button></div>
       <div class="section-title" style="font-size:16px;margin-top:28px">Hidden</div>
       ${[...(S.st.hidden_channels || []).map((k) => ["channel", k, `${k.startsWith("t:") ? "Twitch" : "Kick"} · ${k.slice(2)}`]), ...(S.st.hidden_categories || []).map((k) => ["category", k, `Category · ${k}`])]
@@ -688,6 +769,8 @@ function playEnter() {
 }
 
 function setView(v) {
+  if (v === "multi" && S.view !== "multi") mvAdoptCurrent();
+  if (S.view === "multi" && v !== "multi") mvTeardown();
   if (S.view === "channel" && v !== "channel") minimizeOrLeave();
   const changed = S.view !== v;
   S.view = v;
@@ -822,7 +905,7 @@ api.onUnload(() => btn.remove());</code></pre>
   "plugins": [ { "id": "my-plugin", "name": "My Plugin", "version": "1.0.0",
                  "author": "you", "description": "…",
                  "manifest": "my-plugin/manifest.json", "code": "my-plugin/plugin.js" } ] }</code></pre>
-      <p class="hint">Plugins run with the same access as the app (like browser extensions). Only install plugins you trust.</p>
+      <p class="hint">Plugins run in a sandbox: they can't sign in, chat, spend points or change settings for you. They do see the chat messages they're given and can use the internet, so only install plugins you trust.</p>
     </div>`;
   }
   $("#main").innerHTML = `<div class="page" style="max-width:900px">
@@ -845,9 +928,10 @@ const Preview = {
     this.thumb = thumb;
     this.timer = setTimeout(async () => {
       const [p, l] = thumb.dataset.preview.split("|");
-      let vars = this.cache.get(akey(p, l));
+      const hit = this.cache.get(akey(p, l));
+      let vars = hit && Date.now() - hit.at < 5 * 60000 ? hit.vars : null; // playback tokens expire
       if (!vars) {
-        try { const info = await invoke("resolve", { platform: p, login: l }); vars = info.variants; this.cache.set(akey(p, l), vars); } catch { return; }
+        try { const info = await invoke("resolve", { platform: p, login: l }); vars = info.variants; this.cache.set(akey(p, l), { vars, at: Date.now() }); } catch { return; }
       }
       if (this.thumb !== thumb || !vars?.length) return;
       const v = vars[vars.length - 1]; // lowest quality is plenty for a preview
@@ -881,7 +965,7 @@ document.addEventListener("mouseover", (e) => {
   if (!tipRow) { tip?.classList.remove("on"); return; }
   if (!tip) { tip = el('<div class="side-tip" id="sideTip"></div>'); document.body.appendChild(tip); }
   const [name, cat, viewers, title] = tipRow.dataset.tip.split("|");
-  tip.innerHTML = `<div class="st-name">${name}</div><div class="st-cat">${viewers ? `<span class="live-dot"></span>${viewers} · ` : ""}${cat}</div>${title ? `<div class="st-title">${title}</div>` : ""}`;
+  tip.innerHTML = `<div class="st-name">${esc(name)}</div><div class="st-cat">${viewers ? `<span class="live-dot"></span>${esc(viewers)} · ` : ""}${esc(cat)}</div>${title ? `<div class="st-title">${esc(title)}</div>` : ""}`;
   const r = tipRow.getBoundingClientRect();
   tip.style.top = `${r.top + r.height / 2}px`;
   tip.style.left = `${r.right + 10}px`;
@@ -1061,22 +1145,26 @@ async function loadBrowse(more = false) {
   const b = S.browse, f = b.f;
   if (more && (b.loadingMore || !b.more)) return;
   const seq = more ? browseSeq : ++browseSeq;
-  if (more) b.loadingMore = true; else { b.loading = true; b.cards = []; b.twitchCursor = null; b.kickPage = null; }
+  if (more) b.loadingMore = true; else { b.loading = true; b.cards = []; b.twitchCursor = null; b.kickCursor = null; }
   if (S.view === "browse" && b.tab === "live") renderMain();
   try {
     const r = await invoke("browse_page", {
       platform: f.platform, sort: f.sort, language: f.language, tag: f.tag, drops: f.drops,
-      twitchCursor: more ? b.twitchCursor : null, kickPage: more ? b.kickPage : null, first: !more,
+      twitchCursor: more ? b.twitchCursor : null, kickCursor: more ? b.kickCursor : null, first: !more,
     });
     if (seq !== browseSeq) return;
     const seen = new Set(b.cards.map((c) => akey(c.platform, c.login)));
-    b.cards.push(...r.cards.filter((c) => !seen.has(akey(c.platform, c.login))));
-    b.twitchCursor = r.twitch_cursor; b.kickPage = r.kick_page;
-    b.more = !!(r.twitch_cursor || r.kick_page);
+    const fresh = r.cards.filter((c) => !seen.has(akey(c.platform, c.login)));
+    b.cards.push(...fresh);
+    // a tag filter is applied to Kick pages after loading, so a page can come back empty: keep going a bit
+    b.emptyRun = fresh.length ? 0 : (b.emptyRun || 0) + 1;
+    b.twitchCursor = r.twitch_cursor; b.kickCursor = r.kick_cursor;
+    b.more = !!(r.twitch_cursor || r.kick_cursor);
     b.error = null;
   } catch (e) { if (seq === browseSeq) b.error = String(e); }
   if (seq !== browseSeq) return;
   b.loading = false; b.loadingMore = false; b.at = Date.now();
+  if (b.more && f.tag && b.emptyRun > 0 && b.emptyRun < 6) setTimeout(() => loadBrowse(true), 0);
   if (S.view === "browse" && b.tab === "live") {
     const main = $("#main"), top = main.scrollTop;
     renderMain();
@@ -1122,14 +1210,20 @@ function renderForYou() {
   const box = $("#forYou"); if (!box) return;
   const fy = S.forYou;
   if (!fy.sections) {
-    box.innerHTML = `<div class="section-title">Loading your page…</div><div class="grid">${skeletons(8)}</div>`;
+    box.innerHTML = `<div class="for-you-intro"><span class="eyebrow">MADE FOR YOUR NEXT WATCH</span><h2>Find your next favorite.</h2><p>Streams from Twitch and Kick, together in one place.</p></div><div class="section-title">Loading your page…</div><div class="grid">${skeletons(8)}</div>`;
     if (Date.now() - fy.at > 5000) loadForYou();
     return;
   }
-  box.innerHTML = fy.sections.map((s, i) => `<section class="fy">
+  const featured = sortCards(fy.sections.flatMap((s) => s.cards), "viewers").find(visibleCard);
+  const hero = featured ? `<button class="featured-stream" data-open="${featured.platform}|${esc(featured.login)}">
+    <span class="featured-art">${featured.thumb ? `<img src="${esc(featured.thumb)}" alt="" loading="lazy">` : ""}</span><span class="featured-scrim"></span><span class="featured-content"><span class="eyebrow"><i class="live-dot"></i> LIVE NOW <span class="feature-separator">·</span> ${esc(featured.category || "STREAMING")}</span>
+    <span class="featured-title">${esc(featured.display)} is live</span><span class="featured-subtitle">${esc(featured.title || "Drop in and say hello")}</span>
+    <span class="featured-action">Watch stream <span aria-hidden="true">↗</span></span></span><span class="featured-viewers">${I.user}${fmt(featured.viewers)} watching</span>
+  </button>` : `<div class="for-you-intro"><span class="eyebrow">YOUR STREAMING HOME</span><h2>Find your next favorite.</h2><p>Explore Twitch and Kick streams, all in one place.</p><button class="btn primary" data-view-btn="browse">Explore live streams</button></div>`;
+  box.innerHTML = `${hero}${fy.sections.map((s, i) => `<section class="fy">
       <div class="section-title">${esc(s.title)}<span class="spacer"></span>${s.cat ? `<button class="btn secondary sm" data-fycat="${i}">See all</button>` : s.more ? `<button class="btn secondary sm" data-view-btn="${s.more}">See all</button>` : ""}</div>
-      <div class="grid">${s.cards.map(cardHTML).join("")}</div></section>`).join("")
-    || `<div class="empty"><h2>Follow some channels or categories</h2><p>Your For you page is built from what you watch.</p></div>`;
+      <div class="grid">${s.cards.map(cardHTML).join("")}</div></section>`).join("")}
+    ${!fy.sections.length ? `<div class="empty"><h2>Follow some channels or categories</h2><p>Your For you page gets better as you follow the creators and categories you love.</p><button class="btn primary" data-view-btn="categories">Explore categories</button></div>` : ""}`;
   if (Date.now() - fy.at > 300000) loadForYou();
 }
 
@@ -1150,6 +1244,13 @@ async function loadFollows() {
     console.error(e);
   }
   S.follows.loading = false;
+}
+
+const notifyOn = (p, l) => !(S.st?.notify_muted || []).includes(akey(p, (l || "").toLowerCase()));
+async function setNotify(p, l, on) {
+  S.st = await invoke("set_notify", { platform: p, login: l, on });
+  toast(on ? `Live notifications on for ${l}` : `No more live notifications for ${l}`);
+  if (S.ch?.platform === p && S.ch.login === l) renderChannelInfo();
 }
 
 async function toggleFollow(p, l) {
@@ -1178,6 +1279,8 @@ function destroyPlayer() {
 
 function leaveChannel() {
   const had = !!S.ch;
+  if (S.ch?.recover) clearTimeout(S.ch.recover.timer);
+  try { localStorage.removeItem("ds:lastWatch"); } catch {}
   destroyPlayer();
   S.ch = null;
   S.mini = false;
@@ -1229,6 +1332,7 @@ function restoreFromMini() {
 
 async function openChannel(platform, login) {
   login = login.toLowerCase();
+  if (S.view === "multi") mvTeardown();
   closeMenu();
   hideSuggest();
   if (S.ch && S.ch.platform === platform && S.ch.login === login && S.mini) { restoreFromMini(); return; }
@@ -1238,6 +1342,7 @@ async function openChannel(platform, login) {
   S.ch = { platform, login, info: { display: known?.live?.display || login, title: known?.live?.title || "", category: known?.live?.category || "", viewers: 0, live: false, variants: [], avatar: known?.live?.avatar || known?.avatar }, loading: true, error: null, sel: 0, paused: false, retries: 0, tab: "about", about: null, videos: null, clips: null, vod: null, emotes: null };
   const ch = S.ch;
   S.chatMsgs = []; S.chatRaw = [];
+  S.chatHistShown = false; S.chatLiveMarked = false;
   S.replyTo = null;
   S.points = null;
   S.badges = {};
@@ -1248,9 +1353,10 @@ async function openChannel(platform, login) {
   renderSidebar();
   loadChannelTab();
   if (platform === "Twitch") {
-    S.chatGen = await invoke("chat_join", { platform, login, display: ch.info.display, kickChatroom: null, kickUserId: null, kickChannelId: null });
+    S.chatGen = await invoke("chat_join", { platform, login, display: ch.info.display, kickChatroom: null, kickUserId: null, kickChannelId: null, history: CE.cfg.general.history !== false });
     invoke("twitch_badges", { login }).then((b) => { if (S.ch === ch) S.badges = b; });
     if (S.st.twitch) invoke("points_status", { login }).then((p) => { if (S.ch === ch) { S.points = p; renderPoints(); } }).catch(() => {});
+    if (S.st.twitch) loadEmotes(ch);
   }
   try {
     const info = await invoke("resolve", { platform, login });
@@ -1259,7 +1365,7 @@ async function openChannel(platform, login) {
     ch.loading = false;
     const q = chPref(ch).q;
     if (q) { const i = info.variants.findIndex((v) => v.name === q); if (i > 0) ch.sel = i; }
-    if (platform === "Kick") S.chatGen = await invoke("chat_join", { platform, login, display: info.display, kickChatroom: info.kick_chatroom, kickUserId: info.kick_user_id, kickChannelId: info.kick_channel_id });
+    if (platform === "Kick") S.chatGen = await invoke("chat_join", { platform, login, display: info.display, kickChatroom: info.kick_chatroom, kickUserId: info.kick_user_id, kickChannelId: info.kick_channel_id, history: CE.cfg.general.history !== false });
     renderChannelInfo();
     if (info.live && info.variants.length) startPlayback();
     else setPlayerState("offline");
@@ -1270,7 +1376,7 @@ async function openChannel(platform, login) {
     setPlayerState("error");
     renderChannelInfo();
   }
-  if (S.ch === ch) Plugins.emit("channel:open", { platform, login, display: ch.info.display, live: ch.info.live, title: ch.info.title, category: ch.info.category });
+  if (S.ch === ch) Plugins.emit("channel:open", { platform, login, userId: ch.info.user_id || null, display: ch.info.display, live: ch.info.live, title: ch.info.title, category: ch.info.category });
   uptimeTimer = setInterval(() => { const u = $("#uptime"); if (u && S.ch?.info.started) u.textContent = upClock(S.ch.info.started); }, 1000);
   infoTimer = setInterval(refreshInfo, 60000);
 }
@@ -1279,18 +1385,24 @@ async function refreshInfo() {
   if (!S.ch) return;
   const ch = S.ch;
   try {
-    const info = await invoke("resolve", { platform: ch.platform, login: ch.login });
+    const info = await invoke("resolve", { platform: ch.platform, login: ch.login, meta: true });
     if (S.ch !== ch) return;
     const wasLive = ch.info.live;
-    ch.info = { ...info, variants: ch.info.variants.length ? ch.info.variants : info.variants };
+    ch.info = { ...ch.info, ...info, variants: ch.info.variants };
     renderChannelInfo();
-    if (!wasLive && info.live && !ch.vod) { ch.info.variants = info.variants; startPlayback(); }
+    if (!wasLive && info.live && !ch.vod && !ch.recover) {
+      const full = await invoke("resolve", { platform: ch.platform, login: ch.login });
+      if (S.ch !== ch) return;
+      ch.info.variants = full.variants;
+      if (full.variants.length) startPlayback();
+    }
   } catch {}
 }
 
 function createPlayer() {
   const p = el(`<div class="player paused" id="player">
       <video id="video" playsinline></video>
+      <div class="audio-card" id="audioCard"></div>
       <div class="state" id="pstate"><div class="spinner"></div></div>
       <div class="vod-title hidden" id="vodTitle"></div>
       <button class="big-play" id="bigPlay" title="Play">${I.play}</button>
@@ -1304,6 +1416,8 @@ function createPlayer() {
         <span id="pBadges"></span>
         <span class="grow"></span>
         <span id="pButtons"></span>
+        <span class="sleep-tag hidden" id="cSleep" title="Sleep timer">${I.moon}<span></span></span>
+        <button class="icon-btn ${audioOnly ? "on" : ""}" id="cAudio" title="Audio only (a): video off, far less data; keeps playing in the tray">${I.headphones}</button>
         <button class="icon-btn" id="cClip" title="Save the last 60 seconds as a clip">${I.scissors}</button>
         <button class="icon-btn" id="cPip" title="Picture-in-picture (floats over other windows)">${I.pip}</button>
         <button class="icon-btn" id="cChat" title="Show / hide chat">${I.chat}</button>
@@ -1357,6 +1471,7 @@ function createPlayer() {
     v.currentTime = r[0] + f * (end - r[0]);
   });
   $("#cClip", p).onclick = (e) => { e.stopPropagation(); saveClip(); };
+  $("#cAudio", p).onclick = (e) => { e.stopPropagation(); setAudioOnly(!audioOnly); };
   $("#cPip", p).onclick = async (e) => {
     e.stopPropagation();
     const ch = S.ch;
@@ -1374,7 +1489,7 @@ function createPlayer() {
   v.addEventListener("play", syncPlayUI);
   v.addEventListener("pause", syncPlayUI);
   v.addEventListener("volumechange", syncVolUI);
-  v.addEventListener("playing", () => { setPlayerState("playing"); Plugins.emit("player:playing", {}); });
+  v.addEventListener("playing", () => { setPlayerState("playing"); updateMediaSession(); Plugins.emit("player:playing", {}); });
   v.addEventListener("waiting", () => { if (!v.paused) setPlayerState("buffering"); });
   p.addEventListener("mousemove", () => {
     p.classList.remove("idle");
@@ -1387,7 +1502,7 @@ function createPlayer() {
   $("#cMute", p).onclick = () => { v.muted = !v.muted; };
   $("#cVol", p).oninput = (e) => { v.muted = false; v.volume = e.target.value / 100; };
   $("#cVol", p).onchange = (e) => { S.st.volume = +e.target.value; invoke("set_prefs", { volume: +e.target.value }); if (S.ch) setChPref(S.ch, { vol: +e.target.value }); };
-  $("#cLive", p).onclick = () => { if (hls && hls.liveSyncPosition) v.currentTime = hls.liveSyncPosition; v.play(); };
+  $("#cLive", p).onclick = () => { if (hls && hls.liveSyncPosition) v.currentTime = hls.liveSyncPosition; playSafe(v); };
   $("#cTheater", p).onclick = toggleTheater;
   $("#cFull", p).onclick = toggleFullscreen;
   $("#cChat", p).onclick = () => {
@@ -1416,7 +1531,7 @@ function renderPlayerExtras() {
   const b = $("#pBadges"), btns = $("#pButtons");
   if (!b || !btns) return;
   b.innerHTML = Plugins.ui.badges.filter((x) => x.visible).map((x) => `<span class="adtag">${esc(x.text)}</span>`).join("");
-  btns.innerHTML = Plugins.ui.player.map((x, i) => `<button class="icon-btn ${x.active ? "on" : ""}" data-pplayer="${i}" title="${esc(x.title || "")}">${x.icon || I.puzzle}</button>`).join("");
+  btns.innerHTML = Plugins.ui.player.map((x, i) => `<button class="icon-btn ${x.active ? "on" : ""}" data-pplayer="${i}" title="${esc(x.title || "")}">${pluginIcon(x.icon)}</button>`).join("");
 }
 
 function syncPlayUI() {
@@ -1430,7 +1545,7 @@ function syncVolUI() {
   $("#cVol").value = v.muted ? 0 : Math.round(v.volume * 100);
   $("#cVol").style.setProperty("--p", $("#cVol").value + "%");
 }
-function togglePause() { const v = $("#video"); if (!v) return; v.paused ? v.play() : v.pause(); }
+function togglePause() { const v = $("#video"); if (!v) return; if (v.paused) playSafe(v); else v.pause(); }
 
 function setPlayerState(kind) {
   const p = $("#pstate"); if (!p || !S.ch) return;
@@ -1438,7 +1553,16 @@ function setPlayerState(kind) {
   if (kind === "playing") { p.classList.add("hidden"); return; }
   p.classList.remove("hidden");
   if (kind === "buffering" || kind === "loading") p.innerHTML = '<div class="spinner"></div>';
-  else if (kind === "offline") p.innerHTML = `${avatar(S.ch.platform, i.avatar, i.display, "xl")}<h3>${esc(i.display)} is offline</h3><p>Chat is still open.</p>`;
+  else if (kind === "offline") p.innerHTML = document.documentElement.classList.contains("browser-preview")
+    ? `<h3>Browser preview</h3><p>Live playback and chat are available in the desktop app. This channel is sample data.</p>`
+    : `${avatar(S.ch.platform, i.avatar, i.display, "xl")}<h3>${esc(i.display)} is offline</h3><p>Chat is still open.</p>`;
+  else if (kind === "reconnecting") p.innerHTML = navigator.onLine
+    ? `<div class="spinner"></div><h3>Reconnecting…</h3><p>The stream dropped. You'll be put back where you were.</p>`
+    : `<div class="spinner"></div><h3>No internet connection</h3><p>The stream resumes on its own when you're back online.</p>`;
+  else if (kind === "waiting") {
+    p.innerHTML = `${avatar(S.ch.platform, i.avatar, i.display, "xl")}<h3>${esc(i.display)} went offline</h3><p>Waiting for the stream to come back. It resumes automatically.</p><button class="btn secondary" id="stopWaitBtn" style="margin-top:8px">Stop waiting</button>`;
+    $("#stopWaitBtn").onclick = () => { const r = S.ch?.recover; if (r) clearTimeout(r.timer); if (S.ch) S.ch.recover = null; setPlayerState("offline"); };
+  }
   else if (kind === "error") p.innerHTML = `<h3>Playback stopped</h3><p>${esc(S.ch.error || "Something went wrong.")}</p><button class="btn secondary" id="retryBtn" style="margin-top:8px">Retry</button>`;
   else if (kind === "pip") {
     p.innerHTML = `<div class="pip-note">${I.pip}</div><h3>Playing in picture-in-picture</h3><p>The stream is in its floating window. Chat stays here.</p><button class="btn secondary" id="pipBackBtn" style="margin-top:8px">Bring it back</button>`;
@@ -1447,45 +1571,243 @@ function setPlayerState(kind) {
   const r = $("#retryBtn"); if (r) r.onclick = () => { const { platform, login } = S.ch; leaveChannel(); openChannel(platform, login); };
 }
 
-async function startPlayback() {
+async function startPlayback(opts = {}) {
   const ch = S.ch; if (!ch) return;
   const v = $("#video");
   if (hls) { hls.destroy(); hls = null; }
-  setPlayerState("loading");
+  setPlayerState(ch.recover ? (ch.recover.waiting ? "waiting" : "reconnecting") : "loading");
   syncVodUI();
   // Always load a concrete quality playlist ("Auto" = best). Kick's master playlist has no CORS
   // header, so the page can't read it; the per-quality playlists and segments can be read.
   const vod = ch.vod;
   const vars = vod ? vod.variants : ch.info.variants;
   const sel = vod ? vod.sel : ch.sel;
-  const idx = sel === 0 && vars.length > 1 ? 1 : Math.min(sel, vars.length - 1);
+  let idx = sel === 0 && vars.length > 1 ? 1 : Math.min(sel, vars.length - 1);
+  if (!vod && audioOnly && vars.length) {
+    // Twitch has an audio-only rendition; Kick doesn't, so its smallest one plays with the picture hidden
+    const a = vars.findIndex(isAudioVariant);
+    idx = a >= 0 ? a : vars.reduce((best, x, i) => (i > 0 && !isAudioVariant(x) ? i : best), idx);
+  }
+  $("#player")?.classList.toggle("audio-only", audioOnly && !vod);
+  renderAudioCard();
   if (vod && /\.mp4(\?|$)/.test(vars[idx].url)) { // Twitch clips are plain MP4 files
     v.removeAttribute("src");
     v.src = vars[idx].url;
     v.play().catch(() => {});
     return;
   }
-  const url = vod ? vars[idx].url : await invoke("play_url", { platform: ch.platform, login: ch.login, name: vars[idx].name, url: vars[idx].url });
+  const url = vod ? vars[idx].url : (opts.reuse && ch.playUrl) || await invoke("play_url", { platform: ch.platform, login: ch.login, name: vars[idx].name, url: vars[idx].url });
   if (S.ch !== ch || ch.vod !== vod) return;
+  if (!vod) { ch.playUrl = url; try { localStorage.setItem("ds:lastWatch", JSON.stringify({ platform: ch.platform, login: ch.login, at: Date.now() })); } catch {} }
   const low = !!S.st.low_latency && !vod;
   hls = new Hls(vod
-    ? { maxBufferLength: 60, backBufferLength: 30, enableWorker: true, startPosition: 0 }
+    ? { maxBufferLength: 30, backBufferLength: 30, enableWorker: true, startPosition: 0 }
     // start ~3-6 s behind live; a huge max latency so rewinding (DVR) is never yanked back to live
-    : { lowLatencyMode: low, liveSyncDuration: low ? 3 : 6, liveMaxLatencyDuration: 7200, maxBufferLength: 30, backBufferLength: 90, enableWorker: true });
+    : { lowLatencyMode: low, liveSyncDuration: low ? 3 : 6, liveMaxLatencyDuration: 7200, maxBufferLength: 30, backBufferLength: 30, enableWorker: true });
   hls.on(Hls.Events.MANIFEST_PARSED, () => {
     v.play().catch(() => { v.muted = true; v.play().catch(() => {}); toast("Muted autoplay. Click the speaker to unmute."); });
   });
   hls.on(Hls.Events.ERROR, (_, d) => {
     if (!d.fatal) return;
-    if (d.type === Hls.ErrorTypes.NETWORK_ERROR && ch.retries < 5) { ch.retries++; setTimeout(() => hls && hls.startLoad(), 1500); return; }
-    if (d.type === Hls.ErrorTypes.MEDIA_ERROR && ch.retries < 5) { ch.retries++; hls.recoverMediaError(); return; }
+    if (d.type === Hls.ErrorTypes.NETWORK_ERROR && ch.retries < 3) { ch.retries++; setTimeout(() => hls && hls.startLoad(), 1500); return; }
+    if (d.type === Hls.ErrorTypes.MEDIA_ERROR && ch.retries < 3) { ch.retries++; hls.recoverMediaError(); return; }
+    if (!vod) { recoverMain(d.details); return; } // live: reconnect on our own instead of giving up
     ch.error = d.details === "manifestLoadError" ? "The stream couldn't be loaded. It may have just ended." : `Player error: ${d.details}`;
     setPlayerState("error");
   });
   hls.on(Hls.Events.FRAG_LOADED, () => { ch.retries = 0; });
+  if (!vod && ch.recover) hls.once(Hls.Events.FRAG_BUFFERED, () => recovered(ch));
   hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) invoke("js_log", { msg: `hls fatal ${d.type} ${d.details} ${d.response?.code || ""}` }); });
   hls.loadSource(url);
   hls.attachMedia(v);
+}
+
+// ------------------------------------------------------------------ stream interruption recovery
+// A dropped stream (network blip, CDN hiccup, the streamer's OBS crashing) reconnects by itself with back-off,
+// and the viewer is put back at the same distance behind live.
+const RETRY_STEPS = [1500, 3000, 5000, 8000, 12000, 20000, 30000];
+const retryDelay = (n) => RETRY_STEPS[Math.min(n, RETRY_STEPS.length - 1)];
+
+function recoverMain(why) {
+  const ch = S.ch; if (!ch || ch.vod) return;
+  const r = ch.recover || (ch.recover = { n: 0, since: Date.now(), behind: null, waiting: false, timer: null });
+  if (r.timer) return;
+  const v = $("#video");
+  if (r.behind === null && hls?.liveSyncPosition && v) r.behind = Math.max(0, hls.liveSyncPosition - v.currentTime);
+  if (hls) { hls.destroy(); hls = null; }
+  if (Date.now() - r.since > 15 * 60000) { // give up waiting; refreshInfo still checks every minute
+    ch.recover = null; ch.info.live = false; setPlayerState("offline"); renderChannelInfo(); return;
+  }
+  setPlayerState(r.waiting ? "waiting" : "reconnecting");
+  if (why) invoke("js_log", { msg: `recover: ${why} (attempt ${r.n + 1})` });
+  r.timer = setTimeout(() => attemptRecover(ch), navigator.onLine ? (r.waiting ? 10000 : retryDelay(r.n)) : 30000);
+}
+
+async function attemptRecover(ch) {
+  const r = ch.recover; if (!r || S.ch !== ch) return;
+  r.timer = null;
+  r.n++;
+  // First tries: the same local stream. The proxy keeps the rewind history, so a short blip loses nothing.
+  if (r.n <= 2 && ch.playUrl && !r.waiting) { startPlayback({ reuse: true }); return; }
+  try {
+    const info = await invoke("resolve", { platform: ch.platform, login: ch.login });
+    if (S.ch !== ch || ch.recover !== r) return;
+    if (!info.live || !info.variants.length) {
+      if (S.sleep?.eos) { ch.recover = null; ch.info = { ...ch.info, live: false }; renderChannelInfo(); sleepNow(); return; }
+      if (!r.waiting) { r.waiting = true; ch.info = { ...ch.info, live: false }; renderChannelInfo(); }
+      recoverMain();
+      return;
+    }
+    const sameBroadcast = !info.started || !ch.info.started || info.started === ch.info.started;
+    const qName = ch.info.variants[ch.sel]?.name;
+    ch.info = info;
+    const qi = info.variants.findIndex((x) => x.name === qName);
+    ch.sel = qi >= 0 ? qi : 0;
+    if (!sameBroadcast) r.behind = null; // a new broadcast: the old rewind history is gone, start at live
+    renderChannelInfo();
+    startPlayback();
+  } catch { if (S.ch === ch && ch.recover === r) recoverMain(); }
+}
+
+function recovered(ch) {
+  const r = ch.recover; if (!r || S.ch !== ch) return;
+  ch.recover = null;
+  ch.retries = 0;
+  const v = $("#video");
+  let note = r.waiting ? `${ch.info.display} is back. Resumed.` : "Reconnected";
+  if (r.behind > 5 && hls?.liveSyncPosition && v) {
+    const target = hls.liveSyncPosition - r.behind;
+    const start = v.seekable.length ? v.seekable.start(0) : target;
+    v.currentTime = Math.max(start, target);
+    if (target < start - 5) note = "Reconnected. Rewound as far back as the stream allows.";
+  }
+  if (r.n > 0 || r.waiting) toast(note);
+}
+
+// Watchdog: a live stream whose picture hasn't moved for 15 s while not paused gets reconnected.
+const stall = { t: -1, at: 0 };
+setInterval(() => {
+  if (Preview.el && !Preview.el.isConnected) Preview.stop(); // its card was re-rendered away: stop downloading
+  const ch = S.ch, v = $("#video");
+  if (!ch || ch.vod || ch.recover || !hls || !v || v.paused || v.seeking) { stall.at = 0; return; }
+  if (v.currentTime !== stall.t) { stall.t = v.currentTime; stall.at = Date.now(); return; }
+  if (stall.at && Date.now() - stall.at > 15000) { stall.at = 0; recoverMain("stalled"); }
+}, 2000);
+window.addEventListener("online", () => {
+  const ch = S.ch, r = ch?.recover;
+  if (r?.timer) { clearTimeout(r.timer); r.timer = null; attemptRecover(ch); }
+  if (typeof mvOnline === "function") mvOnline();
+});
+window.addEventListener("offline", () => { if (S.ch?.recover && !S.ch.recover.waiting) setPlayerState("reconnecting"); });
+
+/** After an unclean exit (crash, killed, shut down mid-stream), offer to continue what was playing. */
+async function offerResume() {
+  let lw = null;
+  try { lw = JSON.parse(localStorage.getItem("ds:lastWatch") || "null"); localStorage.removeItem("ds:lastWatch"); } catch {}
+  if (!lw || S.popout || Date.now() - lw.at > 6 * 3600000) return;
+  let display = lw.login;
+  if (!lw.multi) {
+    try { const info = await invoke("resolve", { platform: lw.platform, login: lw.login }); if (!info.live) return; display = info.display; } catch { return; }
+  }
+  if (S.ch || S.view === "multi") return; // something is already playing
+  const bar = el(`<div class="update-bar resume-bar" id="resumeBar">${I.play}<span>${lw.multi ? "Pick up your multiview where you left off?" : `Continue watching <b>${esc(display)}</b>?`}</span>
+    <button class="btn primary sm" data-resume>Resume</button><button class="icon-btn" data-resume-x title="Dismiss">${I.close}</button></div>`);
+  document.body.appendChild(bar);
+  $("[data-resume]", bar).onclick = () => { bar.remove(); if (lw.multi) setView("multi"); else openChannel(lw.platform, lw.login); };
+  $("[data-resume-x]", bar).onclick = () => bar.remove();
+  setTimeout(() => bar.remove(), 20000);
+}
+
+// ---------------------------------------------------------------- audio only
+let audioOnly = localStorage.getItem("ds:audioOnly") === "1";
+const isAudioVariant = (v) => /audio/i.test(v?.name || "");
+function setAudioOnly(on) {
+  audioOnly = on;
+  try { localStorage.setItem("ds:audioOnly", on ? "1" : "0"); } catch {}
+  $("#cAudio")?.classList.toggle("on", on);
+  toast(on ? "Audio only: video is off and the stream keeps playing in the tray" : "Video is back");
+  if (S.ch?.info.live && !S.ch.vod && !S.ch.inPip) startPlayback();
+}
+function renderAudioCard() {
+  const box = $("#audioCard"); if (!box || !S.ch) return;
+  const i = S.ch.info;
+  box.innerHTML = `${avatar(S.ch.platform, i.avatar, i.display, "xl")}<div class="ac-name">${esc(i.display)}</div>
+    <div class="ac-bars"><i></i><i></i><i></i><i></i><i></i></div><div class="ac-note">Audio only · press A for video</div>`;
+}
+
+// ---------------------------------------------------------------- Windows media controls (media keys, the volume flyout)
+function updateMediaSession() {
+  if (!("mediaSession" in navigator) || !S.ch) return;
+  const i = S.ch.info;
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: S.ch.vod ? S.ch.vod.title || i.display : i.title || `${i.display} is live`,
+      artist: `${i.display} · ${S.ch.platform}`,
+      album: "duostream",
+      artwork: i.avatar ? [{ src: i.avatar, sizes: "150x150" }] : [],
+    });
+    navigator.mediaSession.setActionHandler("play", () => playSafe($("#video")));
+    navigator.mediaSession.setActionHandler("pause", () => $("#video")?.pause());
+    navigator.mediaSession.setActionHandler("stop", () => leaveChannel());
+  } catch {}
+}
+
+// ---------------------------------------------------------------- sleep timer
+// S.sleep = { until: ms } | { eos: true } (stop when the stream ends) | null
+const SLEEP_OPTS = [["", "Off"], ["15", "15 minutes"], ["30", "30 minutes"], ["45", "45 minutes"], ["60", "1 hour"], ["90", "1.5 hours"], ["120", "2 hours"], ["eos", "When the stream ends"]];
+function setSleep(v) {
+  S.sleep = !v ? null : v === "eos" ? { eos: true, v } : { until: Date.now() + +v * 60000, v };
+  toast(!v ? "Sleep timer off" : v === "eos" ? "Playback stops when the stream ends" : `Playback stops in ${SLEEP_OPTS.find((o) => o[0] === v)[1]}`);
+  syncSleepTag();
+}
+function syncSleepTag() {
+  const t = $("#cSleep"); if (!t) return;
+  t.classList.toggle("hidden", !S.sleep);
+  if (!S.sleep) return;
+  const left = S.sleep.eos ? "end" : `${Math.max(1, Math.ceil((S.sleep.until - Date.now()) / 60000))}m`;
+  $("span", t).textContent = left;
+}
+/** Fade out over a few seconds, then stop everything that plays (channel, multiview). */
+async function sleepNow() {
+  S.sleep = null;
+  syncSleepTag();
+  const vids = [$("#video"), ...(typeof MV !== "undefined" ? MV.tiles.map((t) => t.video) : [])].filter((v) => v && !v.paused && !v.muted);
+  const start = vids.map((v) => v.volume);
+  for (let k = 1; k <= 12; k++) { await new Promise((r) => setTimeout(r, 500)); vids.forEach((v, i) => { v.volume = start[i] * (1 - k / 12); }); }
+  if (S.view === "multi") { mvTeardown(); setView("following"); }
+  else if (S.ch && !S.ch.multi) {
+    destroyPlayerMedia();
+    const p = $("#pstate");
+    if (p) { p.classList.remove("hidden"); p.innerHTML = `<div class="pip-note">${I.moon}</div><h3>Sleep timer stopped playback</h3><button class="btn secondary" id="wakeBtn" style="margin-top:8px">Keep watching</button>`; $("#wakeBtn").onclick = () => startPlayback(); }
+  }
+  vids.forEach((v, i) => { v.volume = start[i]; });
+  const visible = await appWindow.isVisible().catch(() => true);
+  if (!visible) invoke("tray_sleep"); // was playing audio in the tray: let the app sleep too
+}
+setInterval(() => {
+  if (!S.sleep) return;
+  syncSleepTag();
+  if (S.sleep.until && Date.now() >= S.sleep.until) sleepNow();
+}, 5000);
+
+// ---------------------------------------------------------------- raids
+const followRaids = () => localStorage.getItem("ds:followRaids") !== "0";
+/** The channel you're watching raids `target`: offer (or, by default, do) going along. */
+function onRaid(target, text) {
+  const ch = S.ch;
+  if (S.popout || !ch || ch.multi || !target || target === ch.login) return;
+  $("#raidBar")?.remove();
+  const auto = followRaids();
+  const bar = el(`<div class="update-bar raid-bar" id="raidBar">${I.raid}<span>${esc(ch.info.display)} is raiding <b>${esc(text.replace(/^Raiding /, "") || target)}</b>${auto ? ' · going in <b id="raidN">6</b>s' : ""}</span>
+    <button class="btn primary sm" data-raid-go>Go now</button><button class="btn secondary sm" data-raid-stay>Stay</button></div>`);
+  document.body.appendChild(bar);
+  let n = 6, timer = null;
+  const go = () => { clearInterval(timer); bar.remove(); if (S.ch === ch) openChannel(ch.platform, target); };
+  const stay = () => { clearInterval(timer); bar.remove(); };
+  $("[data-raid-go]", bar).onclick = go;
+  $("[data-raid-stay]", bar).onclick = stay;
+  if (auto) timer = setInterval(() => { n--; const x = $("#raidN"); if (x) x.textContent = String(n); if (n <= 0) go(); }, 1000);
+  else setTimeout(stay, 30000);
 }
 
 function toggleQualityMenu() {
@@ -1494,22 +1816,24 @@ function toggleQualityMenu() {
   if (existing) { existing.remove(); player.classList.remove("menu-open"); return; }
   const ch = S.ch; if (!ch) return;
   const vod = ch.vod;
-  const items = (vod ? vod.variants : ch.info.variants).map((v, i) => ({
+  const items = (vod ? vod.variants : ch.info.variants).map((v, i) => (isAudioVariant(v) ? null : {
     label: v.name.replace(" (source)", " (Source)"), sel: (vod ? vod.sel : ch.sel) === i,
     run: () => {
       if (vod) { const t = $("#video").currentTime; vod.sel = i; startPlayback().then(() => { const vv = $("#video"); vv.addEventListener("loadedmetadata", () => { vv.currentTime = t; }, { once: true }); }); return; }
       ch.sel = i; setChPref(ch, { q: i === 0 ? null : v.name }); startPlayback();
     },
   }));
-  const m = el(`<div class="qmenu" id="qmenu"><div class="head">Quality</div>
-    ${items.map((it, i) => `<button data-q="${i}" class="${it.sel ? "sel" : ""}"><span>${esc(it.label)}</span>${it.sel ? "✓" : ""}</button>`).join("")}
+  const m = el(`<div class="qmenu" id="qmenu"><div class="head">Quality${audioOnly && !vod ? " · audio only is on" : ""}</div>
+    ${items.map((it, i) => (it ? `<button data-q="${i}" class="${it.sel ? "sel" : ""}"><span>${esc(it.label)}</span>${it.sel ? "✓" : ""}</button>` : "")).join("")}
     <div style="height:1px;background:var(--line);margin:6px 0"></div>
     <div class="row"><span>Low latency</span><button class="switch ${S.st.low_latency ? "on" : ""}" id="swLow"></button></div>
+    ${vod ? "" : `<div class="row"><span>${I.moon}Sleep timer</span><select class="sm" id="sleepSel">${SLEEP_OPTS.map(([v, l]) => `<option value="${v}" ${(S.sleep?.v || "") === v ? "selected" : ""}>${l}</option>`).join("")}</select></div>`}
   </div>`);
   player.appendChild(m);
   player.classList.add("menu-open");
   m.addEventListener("click", (e) => e.stopPropagation());
   $$("button[data-q]", m).forEach((b) => (b.onclick = () => { items[+b.dataset.q].run(); m.remove(); player.classList.remove("menu-open"); }));
+  $("#sleepSel", m)?.addEventListener("change", (e) => setSleep(e.target.value));
   $("#swLow", m).onclick = async (e) => { S.st.low_latency = !S.st.low_latency; e.target.classList.toggle("on"); await invoke("set_prefs", { lowLatency: S.st.low_latency }); startPlayback(); };
 }
 
@@ -1542,20 +1866,26 @@ function renderChannelInfo() {
   const { platform, login, info } = S.ch;
   const followed = isFollowed(platform, login);
   box.innerHTML = `
-    ${avatar(platform, info.avatar, info.display, "xl", info.live)}
-    <div class="who">
-      <div class="uname">${esc(info.display)} ${info.live ? '<span class="live-pill">LIVE</span>' : S.ch.loading ? "" : '<span class="offline-tag">OFFLINE</span>'}</div>
-      <div class="stitle" title="${esc(info.title)}">${esc(info.title || (S.ch.loading ? "Loading…" : ""))}</div>
-      <div class="tags">${info.category ? `<span class="tag cat">${esc(info.category)}</span>` : ""}${ptag(platform)}</div>
+    <div class="channel-identity">
+      ${avatar(platform, info.avatar, info.display, "xl", info.live)}
+      <div class="who">
+        <div class="uname">${esc(info.display)} ${info.live ? "" : S.ch.loading ? "" : '<span class="offline-tag">OFFLINE</span>'}</div>
+        <div class="stitle" title="${esc(info.title)}">${esc(info.title || (S.ch.loading ? "Loading…" : ""))}</div>
+        <div class="tags">${info.category ? `<span class="tag cat">${esc(info.category)}</span>` : ""}${ptag(platform)}</div>
+      </div>
     </div>
     <div class="actions">
+      ${info.live ? `<div class="stats"><span class="v">${I.user}<span data-n="${info.viewers || 0}" data-k="c:${akey(platform, login)}" data-full>${(info.viewers || 0).toLocaleString()}</span><small>watching</small></span><span class="uptime-stat"><small>UPTIME</small><span id="uptime">${upClock(info.started)}</span></span></div>` : ""}
       <div class="row">
+        ${info.live && !S.ch.vod ? `<button class="btn secondary sm mv-open" id="mvOpenBtn" title="Watch this next to other streams">${I.grid}Multiview</button>` : ""}
+        ${followed ? `<button class="icon-btn bell-btn ${notifyOn(platform, login) ? "on" : ""}" id="bellBtn" title="${notifyOn(platform, login) ? "Live notifications on for this channel" : "Live notifications off for this channel"}">${notifyOn(platform, login) ? I.bell : I.bellOff}</button>` : ""}
         <button class="follow-btn ${followed ? "on" : ""}" id="followBtn"><span class="fh">${I.heartFill}<i class="burst"></i></span><span class="fl"><span class="f-a">${followed ? "Following" : "Follow"}</span>${followed ? '<span class="f-b">Unfollow</span>' : ""}</span></button>
       </div>
-      ${info.live ? `<div class="stats"><span class="v">${I.user}<span data-n="${info.viewers || 0}" data-k="c:${akey(platform, login)}" data-full>${(info.viewers || 0).toLocaleString()}</span></span><span id="uptime">${upClock(info.started)}</span></div>` : ""}
     </div>`;
   animateCounts(box);
   $("#followBtn").onclick = () => toggleFollow(platform, login);
+  const bell = $("#bellBtn"); if (bell) bell.onclick = () => setNotify(platform, login, !notifyOn(platform, login));
+  const mvb = $("#mvOpenBtn"); if (mvb) mvb.onclick = () => setView("multi");
 }
 
 // ------------------------------------------------------------------ channel tabs: About / Videos / Clips
@@ -1634,9 +1964,11 @@ async function saveClip() {
   if (S.ch?.vod) { toast("Clips work on live streams"); return; }
   if (!S.ch?.info.live) { toast("The stream is offline"); return; }
   clipBusy = true;
-  toast("Saving the last 60 seconds…");
+  toast("Saving the 60 seconds up to what you're watching…");
   try {
-    const path = await invoke("save_clip", { seconds: 60 });
+    const v = $("#video");
+    const behind = v && v.seekable.length ? Math.max(0, v.seekable.end(v.seekable.length - 1) - v.currentTime) : 0;
+    const path = await invoke("save_clip", { seconds: 60, login: S.ch?.login || null, behind });
     toast("Clip saved");
     const t = $("#toast");
     t.innerHTML = `Clip saved · <a href="#" id="revealClip" style="color:var(--brand);font-weight:700">Show in folder</a>`;
@@ -1784,7 +2116,7 @@ function msgHTML(m) {
   const note = CE.user(platform, m.login)?.note;
   const ts = g.timestamps ? `<span class="ce-ts">${new Date(m.ts || Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>` : m.prefix ? `<span class="pre">${esc(m.prefix)}</span>` : "";
   const hlStyle = hl ? ` style="${hl.bg ? `--hlbg:${esc(hl.bg)};` : ""}${hl.color ? `--hlfg:${esc(hl.color)};` : ""}"` : "";
-  const cls = ["msg", hl || m.highlight ? "hl" : "", hl ? "ce-hl" : "", hl?.emph ? "ce-emph" : "", hl?.color ? "ce-hlfg" : ""].filter(Boolean).join(" ");
+  const cls = ["msg", m.history ? "hist" : "", hl || m.highlight ? "hl" : "", hl ? "ce-hl" : "", hl?.emph ? "ce-emph" : "", hl?.color ? "ce-hlfg" : "", m.deleted ? "deleted" : "", m.failed ? "failed" : ""].filter(Boolean).join(" ");
   return `<div class="${cls}" data-seq="${m.seq}" data-p="${platform}"${hlStyle}>
     ${m.reply && !a.compact ? `<div class="rline">${I.reply}<span>Replying to <b>@${esc(m.reply.name)}</b>: ${esc(m.reply.text)}</span></div>` : ""}
     ${ts}${g.platformIcon ? `<span class="ce-pi ${platform === "Kick" ? "k" : "t"}">${PICON[platform] || ""}</span>` : ""}${badges}${ce.fav ? `<span class="ce-fav" title="Favorite">${I.star}</span>` : ""}<span class="u" style="color:${esc(nameColor)}" data-user="${m.seq}">${esc(m.name)}</span>${note ? `<span class="ce-note" title="${esc(note)}">${I.note}</span>` : ""}<span class="t">: ${body}</span>
@@ -1856,14 +2188,17 @@ async function toggleEmotePicker() {
   const ch = S.ch;
   if (!ch.emotes) {
     pop.innerHTML = `<div class="tab-loading"><div class="spinner"></div></div>`;
-    ch.emotes = await invoke("chat_emotes", { platform: ch.platform, login: ch.login }).catch(() => []);
+    await loadEmotes(ch);
     if (S.ch !== ch || pop.dataset.kind !== "em") return;
   }
+  S.pickList = [...ch.emotes, ...[...Plugins.emotes.values()].flatMap((p) => p.list.map((e) => ({ name: e.name, url: e.url, group: p.group, locked: false })))];
+  const all = S.pickList;
+  const pos = new Map(all.map((e, i) => [e, i]));
   const render = (q = "") => {
-    const list = ch.emotes.filter((e) => !q || e.name.toLowerCase().includes(q));
+    const list = all.filter((e) => !q || e.name.toLowerCase().includes(q)).slice(0, 1500);
     const groups = [...new Set(list.map((e) => e.group))];
     $("#emGrid").innerHTML = groups.length ? groups.map((g) => `<div class="em-group">${esc(g)}</div><div class="em-row">${list.filter((e) => e.group === g).map((e) =>
-      `<button class="em-cell ${e.locked ? "locked" : ""}" data-em="${ch.emotes.indexOf(e)}" title="${esc(e.name)}${e.locked ? " (subscribers only)" : ""}"><img src="${esc(e.url)}" alt="" loading="lazy"></button>`).join("")}</div>`).join("")
+      `<button class="em-cell ${e.locked ? "locked" : ""}" data-em="${pos.get(e)}" title="${esc(e.name)}${e.locked ? " (subscribers only)" : ""}"><img src="${esc(e.url)}" alt="" loading="lazy"></button>`).join("")}</div>`).join("")
       : `<div class="hint" style="padding:12px">No emotes found.</div>`;
   };
   pop.innerHTML = `<div class="em-picker"><input id="emSearch" placeholder="Search emotes" spellcheck="false"><div class="em-grid" id="emGrid"></div></div>`;
@@ -1959,22 +2294,76 @@ async function confirmRedeem(i) {
 }
 
 // ------------------------------------------------------------------ backend events
-listen("chat", (e) => {
-  const { gen, messages } = e.payload;
-  if (gen !== S.chatGen) return;
-  const log = $("#chatLog"); if (!log) return;
-  const stick = atBottom(log) && !S.chatView.paused;
+// Chat batches (and re-renders) run one after another: plugins answer asynchronously from their workers.
+let chatChain = Promise.resolve();
+const chatQueue = (fn) => { chatChain = chatChain.then(fn).catch((err) => console.error(err)); };
+listen("chat", (e) => chatQueue(() => onChat(e.payload)));
+/** Emote list of a channel (picker + emotes in your own Twitch messages). */
+function loadEmotes(ch) {
+  if (ch.emotes || ch.emotesLoading) return ch.emotesLoading;
+  ch.emotesLoading = invoke("chat_emotes", { platform: ch.platform, login: ch.login }).catch(() => []).then((e) => { ch.emotes = e; return e; });
+  return ch.emotesLoading;
+}
+
+/** Twitch doesn't echo your own messages, so their emote words are matched against your emote list here. */
+function ownEmotes(m) {
+  const list = S.ch?.emotes; if (!list?.length) return m;
+  const byName = new Map(list.filter((e) => !e.locked).map((e) => [e.name, e.url]));
+  const spans = [];
+  for (const sp of m.spans) {
+    if (sp.t !== "text") { spans.push(sp); continue; }
+    let buf = "";
+    for (const part of sp.v.split(/(\s+)/)) {
+      const url = byName.get(part);
+      if (url) { if (buf) spans.push({ t: "text", v: buf }); buf = ""; spans.push({ t: "emote", v: url }); }
+      else buf += part;
+    }
+    if (buf) spans.push({ t: "text", v: buf });
+  }
+  return { ...m, spans };
+}
+
+/** Moderation and status lines from the backend (m.kind): deleted messages, bans/timeouts, cleared chat, refused sends. */
+function applyChatControl(c) {
+  const mark = (pred, flag) => {
+    for (const m of S.chatRaw) if (pred(m)) m[flag] = true;
+    for (const m of S.chatMsgs) if (pred(m)) { m[flag] = true; $(`#chatLog [data-seq="${m.seq}"]`)?.classList.add(flag); }
+  };
+  if (c.kind === "delete") mark((m) => m.id && m.id === c.target, "deleted");
+  else if (c.kind === "clear_user") mark((m) => (m.login || "").toLowerCase() === c.target, "deleted");
+  else if (c.kind === "clear_all") mark(() => true, "deleted");
+  else if (c.kind === "raid") onRaid(c.target, c.spans?.[0]?.v || "");
+  else if (c.kind === "own_failed") {
+    const last = [...S.chatMsgs].reverse().find((m) => m.target === "self");
+    if (last) mark((m) => m === last || (m.target === "self" && m.ts === last.ts && m.text === last.text), "failed");
+  }
+}
+
+async function onChat({ gen, messages }) {
+  if (gen !== S.chatGen || !$("#chatLog")) return;
+  for (const c of messages) if (c.kind) applyChatControl(c);
+  // control lines only show when they carry text (e.g. "x was timed out for 10m")
+  messages = messages.filter((m) => !m.kind || m.spans?.length).map((m) => (m.target === "self" ? ownEmotes(m) : m));
+  if (!messages.length) return;
   const ctx = chatCtx();
   const now = Date.now();
   // raw copies (pre-filter) let settings changes re-render the visible chat instantly
   for (const m of messages) { m.ts = now; if (!m.system) { S.chatRaw.push(m); } }
   if (S.chatRaw.length > 400) S.chatRaw.splice(0, S.chatRaw.length - 400);
   // pipeline: Chat Enhancer (normalize/filter/users/highlight) -> plugins -> render
-  const shown = messages.map((m) => CE.process(m, ctx)).filter(Boolean).map((m) => Plugins.filterChat(m)).filter(Boolean);
+  const shown = await Plugins.filterChat(messages.map((m) => CE.process(m, ctx)).filter(Boolean));
+  if (gen !== S.chatGen) return; // channel changed while plugins were working
+  const log = $("#chatLog"); if (!log) return;
+  const stick = atBottom(log) && !S.chatView.paused;
   for (const m of shown) { m.seq = ++msgSeq; if (!m.system) S.chatMsgs.push(m); }
   if (S.chatMsgs.length > 400) S.chatMsgs.splice(0, S.chatMsgs.length - 400);
   notifyHighlights(shown);
-  const html = shown.map(msgHTML).join("");
+  let html = "";
+  for (const m of shown) {
+    if (!m.history && S.chatHistShown && !S.chatLiveMarked) { S.chatLiveMarked = true; html += '<div class="msg sys hist-div">Earlier messages above</div>'; }
+    if (m.history) S.chatHistShown = true;
+    html += msgHTML(m);
+  }
   if (!html) return;
   log.insertAdjacentHTML("beforeend", html);
   while (log.childElementCount > 300) log.firstElementChild.remove();
@@ -1986,7 +2375,7 @@ listen("chat", (e) => {
     b.textContent = S.chatView.paused ? `Chat paused · ${S.chatView.pending} new · click to resume` : `${S.chatView.pending} new messages · scroll to resume`;
     b.classList.remove("hidden");
   }
-});
+}
 const msgBySeq = (s) => S.chatMsgs.find((m) => m.seq === +s);
 const chatCtx = () => ({ platform: S.ch?.platform, me: myName(S.ch?.platform) });
 
@@ -1995,7 +2384,7 @@ function notifyHighlights(list) {
   let sound = false;
   for (const m of list) {
     const hl = m.ce?.hl;
-    if (!hl) continue;
+    if (!hl || m.history) continue; // messages from before you joined don't alert
     if (hl.sound) sound = true;
     if (hl.why === "Mentions you" && CE.cfg.notify.desktopOnMention && (document.hidden || !document.hasFocus())) {
       invoke("notify_desktop", { title: `${m.name} mentioned you in ${S.ch?.info?.display || "chat"}`, body: m.text || "" }).catch(() => {});
@@ -2005,14 +2394,23 @@ function notifyHighlights(list) {
 }
 
 /** Rebuild the visible chat from raw messages after a settings change (no reconnect). */
-function rerenderChat() {
-  const log = $("#chatLog"); if (!log || !S.ch) return;
-  const stick = atBottom(log);
+function rerenderChat() { chatQueue(rerenderChatNow); }
+async function rerenderChatNow() {
+  if (!$("#chatLog") || !S.ch) return;
+  const gen = S.chatGen;
   const ctx = chatCtx();
-  const shown = S.chatRaw.slice(-300).map((m) => CE.process(m, ctx, true)).filter(Boolean).map((m) => Plugins.filterChat(m)).filter(Boolean);
+  const shown = await Plugins.filterChat(S.chatRaw.slice(-300).map((m) => CE.process(m, ctx, true)).filter(Boolean));
+  const log = $("#chatLog"); if (!log || !S.ch || gen !== S.chatGen) return;
+  const stick = atBottom(log);
   for (const m of shown) m.seq ||= ++msgSeq;
   S.chatMsgs = shown.slice();
-  log.innerHTML = shown.map(msgHTML).join("") || '<div class="msg sys">No messages match your chat filters yet.</div>';
+  let html = "", hist = false;
+  for (const m of shown) {
+    if (!m.history && hist) { html += '<div class="msg sys hist-div">Earlier messages above</div>'; hist = false; }
+    if (m.history) hist = true;
+    html += msgHTML(m);
+  }
+  log.innerHTML = html || '<div class="msg sys">No messages match your chat filters yet.</div>';
   applyChatView();
   if (stick) log.scrollTop = log.scrollHeight;
 }
@@ -2071,7 +2469,7 @@ listen("drops-connected", async (e) => {
 });
 listen("popout-closed", () => {
   S.popped = false;
-  if (S.ch && S.view === "channel") $("#chat").classList.toggle("hidden", !S.st.show_chat);
+  if (S.ch && (S.view === "channel" || S.view === "multi")) $("#chat").classList.toggle("hidden", !S.st.show_chat);
 });
 // pop-out window: follow whatever channel the main window opens
 listen("chat-context", (e) => { if (S.popout) applyPopoutContext(e.payload); });
@@ -2084,13 +2482,32 @@ listen("auth", async (e) => {
   S.st = await invoke("get_state");
   rerenderAuth();
   if (ok) loadFollows();
+  if (ok && S.ch && !S.popout) rejoinChat(); // the chat box (and a read-only Twitch connection) predate the sign-in
 });
+
+/** Rebuild the chat panel and reconnect, keeping the messages already shown. */
+async function rejoinChat() {
+  const ch = S.ch; if (!ch) return;
+  buildChat();
+  rerenderChat();
+  const i = ch.info || {};
+  const gen = await invoke("chat_join", { platform: ch.platform, login: ch.login, display: i.display || ch.login, kickChatroom: i.kick_chatroom ?? null, kickUserId: i.kick_user_id ?? null, kickChannelId: i.kick_channel_id ?? null, history: false });
+  if (S.ch === ch) S.chatGen = gen;
+}
 
 // pushed every 90 s by the backend's go-live notifier
 listen("follows", (e) => { if (signedIn() && !S.popout) applyFollows(e.payload); });
 
 // closed to tray: stop playback so nothing keeps playing invisibly
-listen("window-hidden", () => { if (S.ch) { leaveChannel(); if (S.view === "channel") setView("following"); } });
+listen("window-hidden", () => {
+  const v = $("#video");
+  if (audioOnly && S.ch && !S.ch.multi && !S.ch.vod && v && !v.paused) { toast("Still playing (audio only). Use the tray icon to come back."); return; }
+  if (S.view === "multi") mvTeardown();
+  if (S.ch) { leaveChannel(); if (S.view === "channel") setView("following"); }
+  if (!S.popout) setTimeout(() => invoke("tray_sleep"), 300); // after the player is gone: let WebView2 free its memory
+});
+// back from the tray: the page was frozen, so pull fresh live status right away
+listen("window-shown", () => { if (signedIn() && !S.popout) loadFollows(); if (S.view === "multi" && !S.popout) mvRender(); });
 
 // ------------------------------------------------------------------ global events
 document.addEventListener("click", (e) => {
@@ -2143,7 +2560,7 @@ document.addEventListener("click", (e) => {
   const ft = e.target.closest("[data-ftab]");
   if (ft) { S.following.tab = ft.dataset.ftab; if (ft.dataset.ftab === "categories" && !S.cats.list.length) loadCategories().then(() => renderMain()); renderMain(); return; }
   const uh = e.target.closest("[data-unhide]");
-  if (uh) { const [kind, key] = uh.dataset.unhide.split("|"); setHidden(kind, key, false); return; }
+  if (uh) { const v = uh.dataset.unhide, i = v.indexOf("|"); setHidden(v.slice(0, i), v.slice(i + 1), false); return; }
   const ctab = e.target.closest("[data-chtab]");
   if (ctab && S.ch) { S.ch.tab = ctab.dataset.chtab; loadChannelTab(); return; }
   const vc = e.target.closest("[data-vod]");
@@ -2160,7 +2577,7 @@ document.addEventListener("click", (e) => {
   const ac = e.target.closest("[data-ac]");
   if (ac) { acPick(+ac.dataset.ac); return; }
   const em = e.target.closest("[data-em]");
-  if (em && S.ch?.emotes) { insertEmote(S.ch.emotes[+em.dataset.em]); return; }
+  if (em && S.pickList) { const e = S.pickList[+em.dataset.em]; if (e) insertEmote(e); return; }
   if (e.target.closest("#ptsBtn")) { togglePointsMenu(); return; }
   const rw = e.target.closest("[data-reward]");
   if (rw) { redeemReward(+rw.dataset.reward); return; }
@@ -2195,9 +2612,9 @@ document.addEventListener("click", (e) => {
   const vb = e.target.closest("[data-view-btn]");
   if (vb) { e.preventDefault(); setView(vb.dataset.viewBtn); return; }
   const pn = e.target.closest("[data-pnav]");
-  if (pn) { Plugins.ui.nav[+pn.dataset.pnav]?.onClick?.(e); return; }
+  if (pn) { Plugins.click(Plugins.ui.nav[+pn.dataset.pnav]); return; }
   const pp = e.target.closest("[data-pplayer]");
-  if (pp) { e.stopPropagation(); Plugins.ui.player[+pp.dataset.pplayer]?.onClick?.(e); return; }
+  if (pp) { e.stopPropagation(); Plugins.click(Plugins.ui.player[+pp.dataset.pplayer]); return; }
   const pref = e.target.closest("[data-pref]");
   if (pref) {
     const key = pref.dataset.pref, on = !pref.classList.contains("on");
@@ -2248,6 +2665,14 @@ document.addEventListener("click", (e) => {
   if (e.target.closest("#reloadPlugins")) {
     for (const id of [...Plugins.loaded.keys()]) Plugins.unload(id);
     Plugins.refresh().then(() => { renderPluginsPage(); toast("Plugins reloaded"); });
+    return;
+  }
+  const rs = e.target.closest("#raidSw");
+  if (rs) { const on = !rs.classList.contains("on"); rs.classList.toggle("on", on); try { localStorage.setItem("ds:followRaids", on ? "1" : "0"); } catch {} return; }
+  const as = e.target.closest("#autostartSw");
+  if (as) {
+    const on = !as.classList.contains("on");
+    invoke("set_autostart", { on }).then((st) => { S.st = st; as.classList.toggle("on", st.autostart); toast(on ? "duostream starts with Windows" : "duostream won't start with Windows"); }).catch((x) => toast(String(x)));
     return;
   }
   if (e.target.closest("#miniExpand")) { restoreFromMini(); return; }
@@ -2367,7 +2792,9 @@ document.addEventListener("contextmenu", (e) => {
   const cat = open.dataset.catName;
   openMenu(e.clientX, e.clientY, [
     { label: "Watch", icon: I.play, run: () => openChannel(p, l) },
+    { label: "Add to multiview", icon: I.grid, run: () => mvAdd(p, l) },
     { label: f ? "Unfollow" : "Follow", icon: f ? I.heartFill : I.heart, run: () => toggleFollow(p, l) },
+    ...(f ? [{ label: notifyOn(p, l) ? "Turn off live notifications" : "Turn on live notifications", icon: notifyOn(p, l) ? I.bellOff : I.bell, run: () => setNotify(p, l, !notifyOn(p, l)) }] : []),
     "-",
     { label: `Hide ${l}`, icon: I.close, run: () => setHidden("channel", akey(p, l.toLowerCase()), true) },
     ...(cat ? [{ label: `Hide category "${cat}"`, icon: I.close, run: () => setHidden("category", cat, true) }] : []),
@@ -2412,10 +2839,12 @@ document.addEventListener("keydown", (e) => {
   if (e.ctrlKey && e.key.toLowerCase() === "f" && $("#chatSearch")) { e.preventDefault(); toggleChatSearch(true); return; }
   if (e.target.closest("input")) return;
   if (e.key === "Escape" && S.theater) { toggleTheater(); return; }
+  if (S.view === "multi" && mvKey(e)) { e.preventDefault(); return; }
   if (S.view !== "channel") return;
   const v = $("#video"); if (!v) return;
   if (e.key === " ") { e.preventDefault(); togglePause(); }
   else if (e.key === "m") v.muted = !v.muted;
+  else if (e.key === "a") setAudioOnly(!audioOnly);
   else if (e.key === "f") toggleFullscreen();
   else if (e.key === "t") toggleTheater();
   else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
@@ -2428,13 +2857,15 @@ document.addEventListener("keydown", (e) => {
 });
 
 // ------------------------------------------------------------------ boot
-function enterApp() {
+function enterApp(offerResumeBar = true) {
   $("#gate").classList.add("hidden");
   $("#shell").classList.remove("hidden");
   $("#sideToggle").innerHTML = I.menu;
   $("#searchBtn").innerHTML = I.search;
-  setView(S.st.follows.length ? "following" : "browse");
+  const previewingInBrowser = document.documentElement.classList.contains("browser-preview");
+  setView(previewingInBrowser || !S.st.follows.length ? "browse" : "following");
   loadFollows();
+  if (offerResumeBar) setTimeout(offerResume, 1500);
   if (!S.browse.at) loadBrowse();
 }
 
@@ -2451,9 +2882,15 @@ function applyPopoutContext(ctx) {
   S.ch = { platform: ctx.platform, login: ctx.login, info: { display: ctx.display }, emotes: null };
   S.chatGen = ctx.gen;
   S.chatMsgs = []; S.chatRaw = []; S.replyTo = null; S.points = null; S.badges = {}; S.kickSubBadges = [];
+  S.chatHistShown = false; S.chatLiveMarked = false;
   document.title = `${ctx.display} · chat`;
   buildChat();
   const ch = S.ch;
+  invoke("user_id", { platform: ch.platform, login: ch.login }).catch(() => null).then((uid) => {
+    if (S.ch !== ch) return;
+    ch.info.user_id = uid;
+    Plugins.emit("channel:open", { platform: ch.platform, login: ch.login, userId: uid, display: ctx.display });
+  });
   if (ch.platform === "Twitch") {
     invoke("twitch_badges", { login: ch.login }).then((b) => { if (S.ch === ch) S.badges = b; });
     if (S.st.twitch) invoke("points_status", { login: ch.login }).then((p) => { if (S.ch === ch) { S.points = p; renderPoints(); } }).catch(() => {});
@@ -2597,7 +3034,7 @@ async function pipBoot() {
       const q = (() => { try { return JSON.parse(localStorage.getItem(`chp:${akey(platform, login)}`) || "{}").q; } catch { return null; } })();
       const vi = Math.max(1, info.variants.findIndex((x) => x.name === q));
       const pick = info.variants[Math.min(vi, info.variants.length - 1)];
-      const url = await invoke("play_url", { platform, login, name: pick.name, url: pick.url });
+      const url = await invoke("play_url", { platform, login, name: pick.name, url: pick.url, dvr: false });
       ph = new Hls({ liveSyncDuration: 6, liveMaxLatencyDuration: 7200, enableWorker: true, maxBufferLength: 20 });
       ph.on(Hls.Events.MANIFEST_PARSED, () => { v.muted = false; v.volume = vol0 / 100; v.play().catch(() => { v.muted = true; v.play().catch(() => {}); }); });
       ph.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) { if (d.type === Hls.ErrorTypes.MEDIA_ERROR) ph.recoverMediaError(); else setTimeout(() => ph?.startLoad(), 1500); } });
@@ -2611,7 +3048,7 @@ async function pipBoot() {
   load(platform, login, display || login);
   listen("pip-target", (e) => load(e.payload.platform, e.payload.login, e.payload.display));
   listen("pip-close", () => appWindow.close());
-  $("#pipPlay").onclick = () => (v.paused ? v.play() : v.pause());
+  $("#pipPlay").onclick = () => (v.paused ? playSafe(v) : v.pause());
   $("#pipMute").onclick = () => { v.muted = !v.muted; };
   $("#pipVol").oninput = (e) => { v.muted = false; v.volume = e.target.value / 100; e.target.style.setProperty("--p", e.target.value + "%"); };
   $("#pipClose").onclick = () => appWindow.close();
@@ -2629,6 +3066,8 @@ async function pipBoot() {
 }
 
 (async function boot() {
+  APP_VERSION = await invoke("app_version").catch(() => "");
+  Upd.current = APP_VERSION;
   if (location.hash.startsWith("#pip=")) {
     S.st = await invoke("get_state");
     pipBoot();
@@ -2655,8 +3094,10 @@ async function pipBoot() {
   initWinbar();
   S.preview = await invoke("preview_mode");
   await Plugins.refresh().catch((e) => console.error(e));
+  const hidden = !(await appWindow.isVisible().catch(() => true));
+  if (hidden) setTimeout(() => invoke("tray_sleep"), 4000); // after the first follow check
   if (signedIn()) {
-    enterApp();
+    enterApp(!hidden);
     const arg = await invoke("startup_arg");
     if (arg === "view:chat") openChatSettings();
     else if (arg && arg.startsWith("view:")) setView(arg.slice(5));
@@ -2665,6 +3106,7 @@ async function pipBoot() {
     $("#gate").classList.remove("hidden");
     renderGate();
   }
+  listen("open-arg", (e) => { const arg = String(e.payload || ""); if (!signedIn()) return; if (arg === "view:chat") openChatSettings(); else if (arg.startsWith("view:")) setView(arg.slice(5)); else doSearch(arg.replace(/^twitch:/, "twitch.tv/").replace(/^kick:/, "kick.com/")); });
   // validate tokens + sync Twitch follows in the background
   invoke("restore_sessions").then(([st, notes]) => {
     S.st = st;

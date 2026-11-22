@@ -23,7 +23,9 @@ try { Invoke-Gh Get $api $null | Out-Null } catch {
   Start-Sleep 3
 }
 
-$version = (Get-Content tauri.conf.json -Raw | ConvertFrom-Json).version
+# the version lives in Cargo.toml only (tauri.conf.json takes it from there)
+$version = ((Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value)
+if (-not $version) { throw "No version found in Cargo.toml" }
 $tag = "v$version"
 
 # 2. signed build

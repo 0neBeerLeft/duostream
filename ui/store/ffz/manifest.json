@@ -1,0 +1,8 @@
+{
+  "id": "ffz",
+  "name": "FFZ Emotes",
+  "version": "1.0.0",
+  "author": "duostream",
+  "description": "Shows FrankerFaceZ emotes in Twitch chat and in the emote picker.",
+  "builtin": true
+}

@@ -123,8 +123,39 @@ fn s(v: &Value) -> Option<String> {
     v.as_str().filter(|x| !x.is_empty()).map(String::from)
 }
 
+/// Stream/VOD thumbnail. Kick lists sizes in `srcset` while `src` is the 1280x720 one; cards are
+/// ~320 px wide, so the 640w entry looks identical and decodes to a quarter of the memory.
 fn thumb(v: &Value) -> Option<String> {
-    s(&v["src"]).or_else(|| s(&v["url"])).or_else(|| s(v))
+    pick_srcset(v["srcset"].as_str(), 640).or_else(|| s(&v["src"])).or_else(|| s(&v["url"])).or_else(|| s(v))
+}
+
+/// Category art: the 285w box art matches Twitch (285x380) instead of the 408x546 original.
+fn art(v: &Value) -> Option<String> {
+    pick_srcset(v["responsive"].as_str(), 285).or_else(|| s(&v["url"]))
+}
+
+/// Avatars are shown at 32-80 px; Kick serves the same picture as -medium (150 px) next to -fullsize (350 px).
+fn avatar(u: Option<String>) -> Option<String> {
+    u.map(|x| x.replace("-fullsize.webp", "-medium.webp"))
+}
+
+/// The smallest srcset entry at least `want` px wide (else the widest one).
+fn pick_srcset(set: Option<&str>, want: u32) -> Option<String> {
+    let mut best: Option<(u32, &str)> = None;
+    for part in set?.split(",") {
+        let mut it = part.split_whitespace();
+        let (Some(url), Some(w)) = (it.next(), it.next()) else { continue };
+        let Ok(w) = w.trim_end_matches("w").parse::<u32>() else { continue };
+        let better = match best {
+            None => true,
+            Some((bw, _)) if bw >= want => w >= want && w < bw,
+            Some((bw, _)) => w > bw,
+        };
+        if better {
+            best = Some((w, url));
+        }
+    }
+    best.map(|(_, u)| u.to_string())
 }
 
 pub fn top_streams() -> Result<Vec<StreamCard>, String> {
@@ -151,10 +182,22 @@ fn channel(slug: &str) -> Result<Value, String> {
     get_json(&format!("https://kick.com/api/v2/channels/{}", enc(slug)))
 }
 
+/// The channel endpoint only carries a stream.kick.com thumb0.jpg URL, which answers 403. The livestream
+/// endpoint (2 KB) has the real sized thumbnails.
+fn live_thumb(slug: &str, fallback: &Value) -> Option<String> {
+    if fallback["srcset"].is_string() {
+        return thumb(fallback);
+    }
+    get_json(&format!("https://kick.com/api/v2/channels/{}/livestream", enc(slug)))
+        .ok()
+        .and_then(|v| thumb(&v["data"]["thumbnail"]))
+        .or_else(|| thumb(fallback))
+}
+
 pub fn live_card(slug: &str) -> Result<(Option<String>, Option<StreamCard>), String> {
     let v = channel(slug)?;
     let ls = &v["livestream"];
-    let avatar = s(&v["user"]["profile_pic"]);
+    let avatar = avatar(s(&v["user"]["profile_pic"]));
     if ls.is_null() {
         return Ok((avatar, None));
     }
@@ -166,14 +209,14 @@ pub fn live_card(slug: &str) -> Result<(Option<String>, Option<StreamCard>), Str
         display: s(&v["user"]["username"]).unwrap_or_else(|| slug.to_string()),
         title: s(&ls["session_title"]).unwrap_or_default(),
         viewers: ls["viewer_count"].as_u64().unwrap_or(0),
-        thumb: thumb(&ls["thumbnail"]),
+        thumb: live_thumb(slug, &ls["thumbnail"]),
         category: s(&ls["categories"][0]["name"]).unwrap_or_default(),
         tags: ls["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default(),
         language: s(&ls["language"]).unwrap_or_default().to_lowercase(),
     })))
 }
 
-pub fn resolve(slug: &str) -> Result<Resolved, String> {
+pub fn resolve(slug: &str, meta: bool) -> Result<Resolved, String> {
     let v = channel(slug)?;
     let ls = &v["livestream"];
     let mut r = Resolved {
@@ -184,12 +227,16 @@ pub fn resolve(slug: &str) -> Result<Resolved, String> {
         kick_chatroom: v["chatroom"]["id"].as_u64(),
         kick_channel_id: v["id"].as_u64(),
         kick_user_id: v["user_id"].as_u64().or(v["user"]["id"].as_u64()),
-        avatar: s(&v["user"]["profile_pic"]),
+        user_id: v["user_id"].as_u64().or(v["user"]["id"].as_u64()).map(|n| n.to_string()),
+        avatar: avatar(s(&v["user"]["profile_pic"])),
         started: s(&ls["start_time"]).or_else(|| s(&ls["created_at"])),
         ..Default::default()
     };
     if let (false, Some(url)) = (ls.is_null(), s(&v["playback_url"])) {
         r.live = true;
+        if meta {
+            return Ok(r);
+        }
         r.variants = match fetch_text(&url) {
             Ok(text) => parse_master(&text, &url),
             Err(_) => vec![Variant { name: "Auto".into(), url }],
@@ -199,6 +246,12 @@ pub fn resolve(slug: &str) -> Result<Resolved, String> {
 }
 
 // ---------------------------------------------------------------- channel pages
+
+/// Kick user id of a channel (for plugins: 7TV emotes).
+pub fn user_id(slug: &str) -> Option<String> {
+    let v = channel(slug).ok()?;
+    v["user_id"].as_u64().or(v["user"]["id"].as_u64()).map(|n| n.to_string())
+}
 
 /// Bio, followers, socials and the channel's subscriber badge images (months -> url).
 pub fn about(slug: &str) -> Result<Value, String> {
@@ -223,7 +276,7 @@ pub fn videos(slug: &str) -> Result<Vec<Value>, String> {
     let v = get_json(&format!("https://kick.com/api/v2/channels/{}/videos", enc(slug)))?;
     Ok(v.as_array().cloned().unwrap_or_default().iter().filter(|x| s(&x["source"]).is_some()).map(|x| json!({
         "id": x["source"], "title": x["session_title"], "seconds": x["duration"].as_u64().map(|ms| ms / 1000), "views": x["views"],
-        "date": x["created_at"], "thumb": x["thumbnail"]["src"], "category": x["categories"][0]["name"],
+        "date": x["created_at"], "thumb": thumb(&x["thumbnail"]), "category": x["categories"][0]["name"],
     })).collect())
 }
 
@@ -246,7 +299,7 @@ pub fn vod_variants(master: &str) -> Result<Vec<Variant>, String> {
 pub fn categories() -> Result<Vec<Value>, String> {
     let v = get_json("https://kick.com/api/v1/subcategories?limit=40&page=1")?;
     Ok(v["data"].as_array().cloned().unwrap_or_default().iter().map(|c| json!({
-        "name": c["name"], "slug": c["slug"], "viewers": c["viewers"], "art": c["banner"]["url"],
+        "name": c["name"], "slug": c["slug"], "viewers": c["viewers"], "art": art(&c["banner"]),
     })).collect())
 }
 
@@ -261,26 +314,49 @@ fn stream_card(it: &Value) -> Option<StreamCard> {
         viewers: it["viewer_count"].as_u64().or(it["viewers"].as_u64()).unwrap_or(0),
         thumb: thumb(&it["thumbnail"]),
         category: s(&it["categories"][0]["name"]).or_else(|| s(&it["category"]["name"])).unwrap_or_default(),
-        avatar: s(&ch["user"]["profile_pic"]).or_else(|| s(&ch["user"]["profilepic"])).or_else(|| s(&ch["profile_picture"])),
+        avatar: avatar(s(&ch["user"]["profile_pic"]).or_else(|| s(&ch["user"]["profilepic"])).or_else(|| s(&ch["profile_picture"]))),
         started: s(&it["start_time"]).or_else(|| s(&it["created_at"])),
         tags: it["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default(),
         language: s(&it["language"]).unwrap_or_default().to_lowercase(),
     })
 }
 
-/// Browse page for Kick: (cards, has more pages). Kick lists streams per language ("en" by default).
-pub fn browse(language: &str, page: u32, ascending: bool) -> Result<(Vec<StreamCard>, bool), String> {
-    let lang = if language.is_empty() || !language.chars().all(|c| c.is_ascii_alphabetic()) { "en" } else { language };
-    let v = get_json(&format!(
-        "https://kick.com/stream/livestreams/{lang}?page={page}&limit=24&sort={}",
-        if ascending { "asc" } else { "desc" }
-    ))?;
-    let cards: Vec<StreamCard> = v["data"].as_array().cloned().unwrap_or_default().iter().filter_map(stream_card).collect();
-    let more = !v["next_page_url"].is_null() && !cards.is_empty();
-    Ok((cards, more))
+/// A stream from web.kick.com's livestream list.
+fn web_card(it: &Value) -> Option<StreamCard> {
+    let ch = &it["channel"];
+    let login = s(&ch["slug"])?;
+    Some(StreamCard {
+        platform: Platform::Kick,
+        display: s(&ch["username"]).unwrap_or_else(|| login.clone()),
+        login,
+        title: s(&it["title"]).unwrap_or_default(),
+        viewers: it["viewer_count"].as_u64().unwrap_or(0),
+        thumb: thumb(&it["thumbnail"]),
+        category: s(&it["category"]["name"]).unwrap_or_default(),
+        avatar: avatar(s(&ch["profile_pic"])),
+        started: s(&it["start_time"]),
+        tags: it["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default(),
+        language: s(&it["language"]).unwrap_or_default().to_lowercase(),
+    })
 }
 
-/// Channel + category search. Short queries use Kick's instant-search index.
+/// Browse page for Kick: (cards, cursor for the next page). `language` is a two-letter code or "" for all.
+/// (kick.com/stream/livestreams/<lang> ignores the language, so this uses web.kick.com's list, which filters.)
+pub fn browse(language: &str, after: Option<&str>) -> Result<(Vec<StreamCard>, Option<String>), String> {
+    let mut url = "https://web.kick.com/api/v1/livestreams?limit=24&sort=viewer_count_desc".to_string();
+    if !language.is_empty() && language.len() <= 3 && language.chars().all(|c| c.is_ascii_alphabetic()) {
+        url.push_str(&format!("&language={}", language.to_lowercase()));
+    }
+    if let Some(a) = after.filter(|a| !a.is_empty()) {
+        url.push_str(&format!("&after={}", enc(a)));
+    }
+    let v = get_json(&url)?;
+    let cards: Vec<StreamCard> = v["data"]["livestreams"].as_array().cloned().unwrap_or_default().iter().filter_map(web_card).collect();
+    let next = s(&v["data"]["pagination"]["next_cursor"]).filter(|_| !cards.is_empty());
+    Ok((cards, next))
+}
+
+// Channel + category search. Short queries use Kick's instant-search index.
 pub fn search(q: &str) -> (Vec<Value>, Vec<Value>) {
     let mut chans = Vec::new();
     let mut cats = Vec::new();
@@ -289,12 +365,12 @@ pub fn search(q: &str) -> (Vec<Value>, Vec<Value>) {
             for c in v["channels"].as_array().cloned().unwrap_or_default() {
                 let Some(slug) = s(&c["slug"]) else { continue };
                 chans.push(json!({
-                    "login": slug, "display": c["user"]["username"], "avatar": c["user"]["profilePic"],
+                    "login": slug, "display": c["user"]["username"], "avatar": avatar(s(&c["user"]["profilePic"])),
                     "live": c["isLive"] == true, "followers": c["followers_count"],
                 }));
             }
             for c in v["categories"].as_array().cloned().unwrap_or_default() {
-                cats.push(json!({ "name": c["name"], "slug": c["slug"], "viewers": c["viewers"], "art": c["banner"]["url"] }));
+                cats.push(json!({ "name": c["name"], "slug": c["slug"], "viewers": c["viewers"], "art": art(&c["banner"]) }));
             }
         }
     }
@@ -340,7 +416,7 @@ pub fn emotes(slug: &str) -> Vec<Value> {
 pub fn user_card(channel_slug: &str, user: &str) -> Result<Value, String> {
     let u = get_json(&format!("https://kick.com/api/v2/channels/{}/users/{}", enc(channel_slug), enc(user)))?;
     Ok(json!({
-        "login": u["slug"], "display": u["username"], "avatar": u["profile_pic"], "following_since": u["following_since"],
+        "login": u["slug"], "display": u["username"], "avatar": avatar(s(&u["profile_pic"])), "following_since": u["following_since"],
         "subscribed_for": u["subscribed_for"], "badges": u["badges"],
     }))
 }
@@ -351,7 +427,7 @@ pub fn user_card(channel_slug: &str, user: &str) -> Result<Value, String> {
 pub fn me(session: &str) -> Result<(String, Option<String>), String> {
     let v = curl_req("GET", "https://kick.com/api/v1/user", Some(session), None)?;
     let name = s(&v["username"]).ok_or("Kick session expired")?;
-    Ok((name, s(&v["profile_pic"]).or_else(|| s(&v["profilepic"]))))
+    Ok((name, avatar(s(&v["profile_pic"]).or_else(|| s(&v["profilepic"])))))
 }
 
 /// Send a chat message as the signed-in kick.com user. `reply` = (message id, username, text).
@@ -372,7 +448,7 @@ pub fn send_message(session: &str, chatroom: u64, text: &str, reply: Option<(&st
 pub fn followed(session: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut cursor = String::from("0");
-    for _ in 0..40 {
+    for _ in 0..500 {
         let v = curl_req("GET", &format!("https://kick.com/api/v2/channels/followed?cursor={cursor}"), Some(session), None)?;
         for c in v["channels"].as_array().cloned().unwrap_or_default() {
             if let Some(slug) = s(&c["channel_slug"]).or_else(|| s(&c["slug"])) {
@@ -430,7 +506,7 @@ pub fn watch_for_drops(session: &str, channel_id: u64, alive: impl Fn() -> bool)
             let _ = st.get_ref().set_read_timeout(Some(Duration::from_secs(1)));
         }
         let handshake = json!({ "type": "channel_handshake", "data": { "message": { "channelId": channel_id.to_string() } } }).to_string();
-        ws.send(Message::Text(handshake.clone().into())).map_err(|e| e.to_string())?;
+        ws.send(Message::Text(handshake.clone())).map_err(|e| e.to_string())?;
         let (mut last_ping, mut last_hs) = (std::time::Instant::now(), std::time::Instant::now());
         loop {
             if !alive() {
@@ -451,7 +527,7 @@ pub fn watch_for_drops(session: &str, channel_id: u64, alive: impl Fn() -> bool)
                 None
             };
             if let Some(m) = msg {
-                if ws.send(Message::Text(m.into())).is_err() {
+                if ws.send(Message::Text(m)).is_err() {
                     break;
                 }
             }
@@ -463,11 +539,17 @@ pub fn watch_for_drops(session: &str, channel_id: u64, alive: impl Fn() -> bool)
 
 // ---------------------------------------------------------------- chat (Pusher websocket)
 
-pub fn spawn_chat(channel_id: Option<u64>, chatroom: u64, tx: Sender<ChatMsg>) {
+/// Joins a Kick chatroom; messages go to `tx` until `alive()` is false (channel switched).
+pub fn spawn_chat(channel_id: Option<u64>, chatroom: u64, tx: Sender<ChatMsg>, alive: impl Fn() -> bool + Send + 'static, with_history: bool) {
     std::thread::spawn(move || {
+        for m in channel_id.filter(|_| with_history).map(history).unwrap_or_default() {
+            if !alive() || tx.send(m).is_err() {
+                return;
+            }
+        }
         let mut backoff = 1;
         let mut failures_without_join = 0;
-        loop {
+        while alive() {
             let mut joined = false;
             // Fresh credentials each attempt; fall back to the legacy key if Kick's endpoint fails.
             let (key, cluster, mut chans) = match channel_id.map(realtime_credentials) {
@@ -478,12 +560,18 @@ pub fn spawn_chat(channel_id: Option<u64>, chatroom: u64, tx: Sender<ChatMsg>) {
                 }
                 None => (LEGACY_KEY.0.to_string(), LEGACY_KEY.1.to_string(), Vec::new()),
             };
-            let room = format!("chatrooms.{chatroom}.v2");
-            if !chans.contains(&room) {
-                chans.push(room);
+            // chat room + the channel's own event channels (kick.com subscribes to these; raids arrive there)
+            let mut want = vec![format!("chatrooms.{chatroom}.v2")];
+            if let Some(id) = channel_id {
+                want.extend([format!("channel.{id}"), format!("channel_{id}")]);
+            }
+            for room in want {
+                if !chans.contains(&room) {
+                    chans.push(room);
+                }
             }
             let url = format!("wss://ws-{cluster}.pusher.com/app/{key}?protocol=7&client=js&version=8.5.0&flash=false");
-            match run_chat(&url, &chans, &tx, &mut joined) {
+            match run_chat(&url, &chans, &tx, &mut joined, &alive) {
                 Ok(()) => return,
                 Err(e) => {
                     failures_without_join = if joined { 0 } else { failures_without_join + 1 };
@@ -496,7 +584,12 @@ pub fn spawn_chat(channel_id: Option<u64>, chatroom: u64, tx: Sender<ChatMsg>) {
                     if joined && tx.send(ChatMsg::system("Chat disconnected, reconnecting…")).is_err() {
                         return;
                     }
-                    std::thread::sleep(Duration::from_secs(backoff));
+                    for _ in 0..backoff {
+                        if !alive() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
                     backoff = (backoff * 2).min(30);
                 }
             }
@@ -504,63 +597,157 @@ pub fn spawn_chat(channel_id: Option<u64>, chatroom: u64, tx: Sender<ChatMsg>) {
     });
 }
 
-fn run_chat(url: &str, channels: &[String], tx: &Sender<ChatMsg>, joined: &mut bool) -> Result<(), String> {
+/// A Kick chat message (live Pusher event or history entry) as a ChatMsg.
+fn kick_msg(d: &Value) -> ChatMsg {
+    let name = s(&d["sender"]["username"]).unwrap_or_else(|| "?".into());
+    let badges = d["sender"]["identity"]["badges"].as_array().cloned().unwrap_or_default().iter().filter_map(|b| {
+        let t = b["type"].as_str()?;
+        Some(match b["count"].as_u64() {
+            Some(n) if t == "subscriber" => format!("subscriber/{n}"),
+            _ => t.to_string(),
+        })
+    }).collect();
+    // live events carry metadata as an object, history as a JSON string; the sender sits in different places
+    let meta = match &d["metadata"] {
+        Value::String(t) => serde_json::from_str::<Value>(t).unwrap_or(Value::Null),
+        v => v.clone(),
+    };
+    let reply = (d["type"] == "reply").then(|| Reply {
+        name: s(&meta["original_sender"]["username"]).or_else(|| s(&meta["original_message"]["sender"]["username"])).unwrap_or_default(),
+        text: s(&meta["original_message"]["content"]).unwrap_or_default(),
+    });
+    ChatMsg {
+        id: s(&d["id"]).unwrap_or_default(),
+        login: s(&d["sender"]["slug"]).unwrap_or_else(|| name.to_lowercase()),
+        color: name_color(d["sender"]["identity"]["color"].as_str(), &name),
+        name,
+        spans: emote_spans(d["content"].as_str().unwrap_or("")),
+        badges,
+        reply,
+        ..Default::default()
+    }
+}
+
+/// The last messages before you joined (oldest first).
+fn history(channel_id: u64) -> Vec<ChatMsg> {
+    let Ok(v) = get_json(&format!("https://kick.com/api/v2/channels/{channel_id}/messages")) else { return Vec::new() };
+    let mut out: Vec<ChatMsg> = v["data"]["messages"].as_array().map(|a| a.iter().map(kick_msg).collect()).unwrap_or_default();
+    out.reverse(); // Kick lists newest first
+    for m in out.iter_mut() {
+        m.history = true;
+    }
+    out
+}
+
+/// Room modes from a ChatroomUpdatedEvent, as "Slow mode (5s)" style labels.
+fn kick_modes(d: &Value) -> Vec<(&'static str, Option<String>)> {
+    let on = |k: &str| d[k]["enabled"] == true;
+    vec![
+        ("slow", on("slow_mode").then(|| format!("Slow mode ({}s)", d["slow_mode"]["message_interval"].as_u64().unwrap_or(0)))),
+        ("followers", on("followers_mode").then(|| match d["followers_mode"]["min_duration"].as_u64() {
+            Some(m) if m > 0 => format!("Followers-only mode ({m} min following)"),
+            _ => "Followers-only mode".to_string(),
+        })),
+        ("subs", on("subscribers_mode").then(|| "Subscribers-only mode".to_string())),
+        ("emotes", on("emotes_mode").then(|| "Emote-only mode".to_string())),
+    ]
+}
+
+fn run_chat(url: &str, channels: &[String], tx: &Sender<ChatMsg>, joined: &mut bool, alive: &dyn Fn() -> bool) -> Result<(), String> {
     let (mut ws, _) = tungstenite::connect(url).map_err(|e| e.to_string())?;
+    // short read timeout so a quiet chat still notices the channel switch
+    if let tungstenite::stream::MaybeTlsStream::NativeTls(s) = ws.get_ref() {
+        let _ = s.get_ref().set_read_timeout(Some(Duration::from_secs(1)));
+    }
     for ch in channels {
         let sub = json!({ "event": "pusher:subscribe", "data": { "auth": "", "channel": ch } });
-        ws.send(Message::Text(sub.to_string().into())).map_err(|e| e.to_string())?;
+        ws.send(Message::Text(sub.to_string())).map_err(|e| e.to_string())?;
     }
+    let mut modes: std::collections::HashMap<&'static str, Option<String>> = Default::default();
     loop {
-        let Message::Text(t) = ws.read().map_err(|e| e.to_string())? else { continue };
+        if !alive() {
+            return Ok(());
+        }
+        let msg = match ws.read() {
+            Ok(m) => m,
+            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        let Message::Text(t) = msg else { continue };
         let Ok(v) = serde_json::from_str::<Value>(t.as_str()) else { continue };
-        match v["event"].as_str().unwrap_or("") {
+        let data = || v["data"].as_str().and_then(|d| serde_json::from_str::<Value>(d).ok()).unwrap_or(Value::Null);
+        let out: Vec<ChatMsg> = match v["event"].as_str().unwrap_or("") {
             "pusher_internal:subscription_succeeded" => {
-                if !*joined {
-                    *joined = true;
-                    if tx.send(ChatMsg::system("Connected to Kick chat")).is_err() {
-                        return Ok(());
-                    }
+                if *joined {
+                    continue;
                 }
+                *joined = true;
+                vec![ChatMsg::system("Connected to Kick chat")]
             }
             "pusher:error" => return Err(v["data"]["message"].as_str().unwrap_or("pusher error").to_string()),
             "pusher:ping" => {
-                ws.send(Message::Text(json!({"event":"pusher:pong","data":{}}).to_string().into()))
+                ws.send(Message::Text(json!({"event":"pusher:pong","data":{}}).to_string()))
                     .map_err(|e| e.to_string())?;
+                continue;
             }
-            "App\\Events\\ChatMessageEvent" => {
-                let Some(d) = v["data"].as_str().and_then(|d| serde_json::from_str::<Value>(d).ok()) else { continue };
-                let name = s(&d["sender"]["username"]).unwrap_or_else(|| "?".into());
-                let badges = d["sender"]["identity"]["badges"].as_array().cloned().unwrap_or_default().iter().filter_map(|b| {
-                    let t = b["type"].as_str()?;
-                    Some(match b["count"].as_u64() {
-                        Some(n) if t == "subscriber" => format!("subscriber/{n}"),
-                        _ => t.to_string(),
-                    })
-                }).collect();
-                let reply = (d["type"] == "reply").then(|| Reply {
-                    name: s(&d["metadata"]["original_sender"]["username"]).unwrap_or_default(),
-                    text: s(&d["metadata"]["original_message"]["content"]).unwrap_or_default(),
-                });
-                let m = ChatMsg {
-                    id: s(&d["id"]).unwrap_or_default(),
-                    login: s(&d["sender"]["slug"]).unwrap_or_else(|| name.to_lowercase()),
-                    color: name_color(d["sender"]["identity"]["color"].as_str(), &name),
-                    name,
-                    spans: emote_spans(d["content"].as_str().unwrap_or("")),
-                    system: false,
-                    badges,
-                    reply,
+            "App\\Events\\ChatMessageEvent" => vec![kick_msg(&data())],
+            "App\\Events\\MessageDeletedEvent" => {
+                let d = data();
+                s(&d["message"]["id"]).map(|id| vec![ChatMsg::control("delete", id, "")]).unwrap_or_default()
+            }
+            "App\\Events\\UserBannedEvent" => {
+                let d = data();
+                let user = s(&d["user"]["username"]).unwrap_or_default();
+                let slug = s(&d["user"]["slug"]).unwrap_or_else(|| user.to_lowercase());
+                let what = match d["duration"].as_u64() {
+                    Some(m) if d["permanent"] != true => format!("{user} was timed out for {m}m"),
+                    _ => format!("{user} was banned"),
                 };
-                if tx.send(m).is_err() {
-                    return Ok(());
+                vec![ChatMsg::control("clear_user", slug, what)]
+            }
+            "App\\Events\\ChatroomClearEvent" => vec![ChatMsg::control("clear_all", "", "Chat was cleared by a moderator")],
+            // the streamer you're watching raids ("hosts") another channel: viewers are sent along
+            "App\\Events\\ChatMoveToSupportedChannelEvent" => {
+                let d = data();
+                let target = s(&d["hosted"]["slug"]).or_else(|| s(&d["slug"])).or_else(|| s(&d["hosted"]["username"]).map(|u| u.to_lowercase()));
+                let name = s(&d["hosted"]["username"]).or_else(|| target.clone()).unwrap_or_default();
+                match target {
+                    Some(t) => vec![ChatMsg::control("raid", t, format!("Raiding {name}"))],
+                    None => continue,
                 }
             }
-            _ => {}
+            // someone raided into this channel
+            "App\\Events\\StreamHostEvent" => {
+                let d = data();
+                let who = s(&d["host_username"]).or_else(|| s(&d["host"]["username"])).unwrap_or_else(|| "Someone".into());
+                let n = d["number_viewers"].as_u64().or(d["viewers_count"].as_u64()).unwrap_or(0);
+                vec![ChatMsg::system(format!("★ {who} is raiding with {n} viewers"))]
+            }
+            "App\\Events\\ChatroomUpdatedEvent" => {
+                let d = data();
+                let first = modes.is_empty();
+                let mut lines = Vec::new();
+                for (k, now) in kick_modes(&d) {
+                    let before = modes.insert(k, now.clone()).flatten();
+                    match (now, before) {
+                        (Some(n), b) if b.as_deref() != Some(n.as_str()) => lines.push(format!("{n} is on")),
+                        (None, Some(b)) if !first => lines.push(format!("{b} is off")),
+                        _ => {}
+                    }
+                }
+                lines.into_iter().map(ChatMsg::system).collect()
+            }
+            _ => continue,
+        };
+        for m in out {
+            if tx.send(m).is_err() {
+                return Ok(());
+            }
         }
     }
 }
 
-/// Kick inlines emotes as `[emote:12345:Name]`.
+// Kick inlines emotes as `[emote:12345:Name]`.
 fn emote_spans(text: &str) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut rest = text;

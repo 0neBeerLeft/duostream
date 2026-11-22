@@ -136,7 +136,12 @@ pub fn top_streams(category: &str) -> Result<Vec<StreamCard>, String> {
 }
 
 /// Live status for many channels: one `users(logins:)` call per 100 channels (results keep input order).
-pub fn live_status(logins: &[String]) -> Result<Vec<(String, Option<String>, Option<StreamCard>)>, String> {
+/// (login, avatar, live stream if live)
+pub type LiveRow = (String, Option<String>, Option<StreamCard>);
+/// (login, display, avatar, (viewers, category) if live)
+pub type SearchRow = (String, String, Option<String>, Option<(u64, String)>);
+
+pub fn live_status(logins: &[String]) -> Result<Vec<LiveRow>, String> {
     let mut out = Vec::new();
     let q = format!("query($l:[String!]){{users(logins:$l){{login profileImageURL(width:70) stream{{{NODE}}}}}}}");
     for chunk in logins.chunks(100) {
@@ -151,7 +156,7 @@ pub fn live_status(logins: &[String]) -> Result<Vec<(String, Option<String>, Opt
 }
 
 /// Channel search for the search-box suggestions: (login, display, avatar, live (viewers, category)).
-pub fn search(q: &str) -> Result<Vec<(String, String, Option<String>, Option<(u64, String)>)>, String> {
+pub fn search(q: &str) -> Result<Vec<SearchRow>, String> {
     let query = "query($q:String!){searchFor(userQuery:$q,platform:\"web\"){channels{items{login displayName profileImageURL(width:50) stream{viewersCount game{displayName}}}}}}";
     let v = gql(json!({ "query": query, "variables": { "q": q } }))?;
     let items = v["data"]["searchFor"]["channels"]["items"].as_array().cloned().unwrap_or_default();
@@ -166,8 +171,8 @@ pub fn search(q: &str) -> Result<Vec<(String, String, Option<String>, Option<(u6
         .collect())
 }
 
-pub fn resolve(login: &str) -> Result<Resolved, String> {
-    let q = "query($l:String!){user(login:$l){login displayName profileImageURL(width:70) stream{title viewersCount createdAt game{displayName}}}}";
+pub fn resolve(login: &str, meta: bool) -> Result<Resolved, String> {
+    let q = "query($l:String!){user(login:$l){id login displayName profileImageURL(width:70) stream{title viewersCount createdAt game{displayName}}}}";
     let v = gql(json!({ "query": q, "variables": { "l": login } }))?;
     let u = &v["data"]["user"];
     if u.is_null() {
@@ -182,9 +187,10 @@ pub fn resolve(login: &str) -> Result<Resolved, String> {
         live: !s.is_null(),
         avatar: u["profileImageURL"].as_str().map(String::from),
         started: s["createdAt"].as_str().map(String::from),
+        user_id: u["id"].as_str().map(String::from),
         ..Default::default()
     };
-    if !r.live {
+    if !r.live || meta {
         return Ok(r);
     }
 
@@ -229,6 +235,25 @@ pub fn master(login: &str, player_type: &str) -> Result<Option<Vec<Variant>>, St
 }
 
 // ---------------------------------------------------------------- channel pages
+
+/// Owner of a video ("video", numeric id) or clip ("clip", slug): { login, title }.
+pub fn link_owner(kind: &str, id: &str) -> Result<Value, String> {
+    let (q, path) = if kind == "clip" {
+        ("query($i:ID!){clip(slug:$i){title broadcaster{login}}}", "clip")
+    } else {
+        ("query($i:ID!){video(id:$i){title owner{login}}}", "video")
+    };
+    let v = gql(json!({ "query": q, "variables": { "i": id } }))?;
+    let n = &v["data"][path];
+    let login = n["broadcaster"]["login"].as_str().or(n["owner"]["login"].as_str()).ok_or("That video isn't available")?;
+    Ok(json!({ "login": login, "title": n["title"] }))
+}
+
+/// Twitch user id of a login (for plugins: 7TV / BTTV / FFZ emotes).
+pub fn user_id(login: &str) -> Option<String> {
+    let v = gql(json!({ "query": "query($l:String!){user(login:$l){id}}", "variables": { "l": login } })).ok()?;
+    v["data"]["user"]["id"].as_str().map(String::from)
+}
 
 /// Bio, follower count, social links and panels.
 pub fn about(login: &str) -> Result<Value, String> {
@@ -432,9 +457,9 @@ pub fn watch_tick(token: &str, client_id: &str, login: &str) -> Result<(), Strin
     let (value, sig) = (t["value"].as_str().ok_or("no token")?, t["signature"].as_str().unwrap_or(""));
     let url = format!("https://usher.ttvnw.net/api/channel/hls/{login}.m3u8?allow_source=true&sig={sig}&token={}", enc(value));
     let master = http().get(&url).call().map_err(err_str)?.into_string().map_err(|e| e.to_string())?;
-    let variant = master.lines().filter(|l| l.starts_with("http")).last().ok_or("offline")?.to_string();
+    let variant = master.lines().rfind(|l| l.starts_with("http")).ok_or("offline")?.to_string();
     let list = http().get(&variant).set("Connection", "close").call().map_err(err_str)?.into_string().map_err(|e| e.to_string())?;
-    if let Some(seg) = list.lines().filter(|l| l.starts_with("http")).last() {
+    if let Some(seg) = list.lines().rfind(|l| l.starts_with("http")) {
         http().head(seg).call().map_err(err_str)?;
     }
     Ok(())
@@ -520,24 +545,114 @@ pub fn claim_drop(client: &str, token: &str, instance: &str) -> Result<(), Strin
     }
 }
 
-// ---------------------------------------------------------------- chat (anonymous IRC over websocket)
+// ---------------------------------------------------------------- raids (Hermes event socket)
+
+/// While `alive()`: listen for the channel starting a raid and report it as a "raid" control line
+/// (target = login). Hermes is the websocket twitch.tv itself uses for these events.
+pub fn watch_raids(login: String, tx: Sender<ChatMsg>, alive: impl Fn() -> bool + Send + 'static) {
+    std::thread::spawn(move || {
+        let Some(id) = user_id(&login) else { return };
+        let mut announced = false;
+        while alive() && !announced {
+            let Ok((mut ws, _)) = tungstenite::connect(format!("wss://hermes.twitch.tv/v1?clientId={CLIENT_ID}")) else {
+                if !sleep_alive(&alive, 30) { return; }
+                continue;
+            };
+            if let tungstenite::stream::MaybeTlsStream::NativeTls(s) = ws.get_ref() {
+                let _ = s.get_ref().set_read_timeout(Some(Duration::from_secs(1)));
+            }
+            let sub = json!({ "type": "subscribe", "id": "duostream", "timestamp": "",
+                "subscribe": { "id": "raid", "type": "pubsub", "pubsub": { "topic": format!("raid.{id}") } } });
+            if ws.send(Message::Text(sub.to_string())).is_err() {
+                continue;
+            }
+            let mut last = std::time::Instant::now();
+            while alive() {
+                match ws.read() {
+                    Ok(Message::Text(t)) => {
+                        last = std::time::Instant::now();
+                        if let Some((target, name)) = raid_target(t.as_str()) {
+                            let _ = tx.send(ChatMsg::control("raid", target, format!("Raiding {name}")));
+                            announced = true;
+                            break;
+                        }
+                    }
+                    Ok(_) => last = std::time::Instant::now(),
+                    Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                        if last.elapsed() > Duration::from_secs(45) {
+                            break; // no keepalive for a while: reconnect
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if !announced && !sleep_alive(&alive, 3) {
+                return;
+            }
+        }
+    });
+}
+
+fn sleep_alive(alive: &dyn Fn() -> bool, secs: u64) -> bool {
+    for _ in 0..secs {
+        if !alive() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    alive()
+}
+
+/// A Hermes notification carrying a pubsub "raid_go_v2" event: (target login, target display name).
+fn raid_target(text: &str) -> Option<(String, String)> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let inner = v["notification"]["pubsub"].as_str()?;
+    let e: Value = serde_json::from_str(inner).ok()?;
+    if e["type"] != "raid_go_v2" {
+        return None;
+    }
+    let r = &e["raid"];
+    let login = r["target_login"].as_str()?.to_lowercase();
+    let name = r["target_display_name"].as_str().unwrap_or(&login).to_string();
+    Some((login, name))
+}
+
+// ---------------------------------------------------------------- chat (IRC over websocket)
 
 /// Outgoing chat line: (reply-to message id, text).
 pub type Outgoing = (Option<String>, String);
 
-/// Connects to chat. With `auth` = (login, token) you can send messages through the returned sender.
-pub fn spawn_chat(login: String, auth: Option<(String, String)>, tx: Sender<ChatMsg>) -> Sender<Outgoing> {
+/// Connects to chat. `auth` gives (login, token) and is asked again on every reconnect, so a refreshed
+/// token is picked up. Messages you send go through the returned sender. Stops once `alive()` is false.
+pub fn spawn_chat(
+    login: String,
+    auth: impl Fn() -> Option<(String, String)> + Send + 'static,
+    tx: Sender<ChatMsg>,
+    alive: impl Fn() -> bool + Send + 'static,
+    with_history: bool,
+) -> Sender<Outgoing> {
     let (out_tx, out_rx) = std::sync::mpsc::channel::<Outgoing>();
     std::thread::spawn(move || {
+        for m in if with_history { history(&login) } else { Vec::new() } {
+            if !alive() || tx.send(m).is_err() {
+                return;
+            }
+        }
         let mut backoff = 1;
-        loop {
-            match run_chat(&login, auth.as_ref(), &out_rx, &tx) {
-                Ok(()) => return, // receiver gone: channel switched
+        while alive() {
+            let a = auth();
+            match run_chat(&login, a.as_ref(), &out_rx, &tx, &alive) {
+                Ok(()) => return, // channel switched
                 Err(e) => {
-                    if tx.send(ChatMsg::system(format!("Chat disconnected ({e}), reconnecting…"))).is_err() {
+                    if !alive() || tx.send(ChatMsg::system(format!("Chat disconnected ({e}), reconnecting…"))).is_err() {
                         return;
                     }
-                    std::thread::sleep(Duration::from_secs(backoff));
+                    for _ in 0..backoff {
+                        if !alive() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
                     backoff = (backoff * 2).min(30);
                 }
             }
@@ -546,11 +661,43 @@ pub fn spawn_chat(login: String, auth: Option<(String, String)>, tx: Sender<Chat
     out_tx
 }
 
+/// The last messages before you joined, from recent-messages.robotty.de (the service Chatterino uses):
+/// raw IRC lines, parsed like live ones. Empty when the service is down or the channel opted out.
+fn history(login: &str) -> Vec<ChatMsg> {
+    let url = format!("https://recent-messages.robotty.de/api/v2/recent-messages/{}?limit=50", enc(login));
+    let Ok(v) = http().get(&url).call().map_err(err_str).and_then(|r| r.into_json::<Value>().map_err(|e| e.to_string())) else {
+        return Vec::new();
+    };
+    let mut room = Room::default();
+    v["messages"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|l| l.as_str()).flat_map(|l| parse_irc(l, &mut room)).filter(|m| !m.system && m.kind.is_empty()).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut m| {
+            m.history = true;
+            m
+        })
+        .collect()
+}
+
+/// Per-connection state: your own badges/color (USERSTATE), room modes (ROOMSTATE), last send time.
+#[derive(Default)]
+struct Room {
+    me_name: String,
+    me_color: String,
+    me_badges: Vec<String>,
+    modes: std::collections::HashMap<String, String>,
+    modes_known: bool,
+    sent_at: Option<std::time::Instant>,
+}
+
 fn run_chat(
     login: &str,
     auth: Option<&(String, String)>,
     outgoing: &std::sync::mpsc::Receiver<Outgoing>,
     tx: &Sender<ChatMsg>,
+    alive: &dyn Fn() -> bool,
 ) -> Result<(), String> {
     let (mut ws, _) = tungstenite::connect("wss://irc-ws.chat.twitch.tv:443").map_err(|e| e.to_string())?;
     if let tungstenite::stream::MaybeTlsStream::NativeTls(s) = ws.get_ref() {
@@ -561,18 +708,41 @@ fn run_chat(
         None => ("PASS SCHMOOPIIE".to_string(), "NICK justinfan58213".to_string()),
     };
     for l in ["CAP REQ :twitch.tv/tags twitch.tv/commands".to_string(), pass, nick, format!("JOIN #{login}")] {
-        ws.send(Message::Text(l.into())).map_err(|e| e.to_string())?;
+        ws.send(Message::Text(l)).map_err(|e| e.to_string())?;
     }
     let who = auth.map(|a| format!(" as {}", a.0)).unwrap_or_else(|| " (read-only, sign in to chat)".into());
     if tx.send(ChatMsg::system(format!("Connected to #{login}{who}"))).is_err() {
         return Ok(());
     }
+    let mut room = Room::default();
     loop {
+        if !alive() {
+            return Ok(());
+        }
         while let Ok((reply_to, text)) = outgoing.try_recv() {
+            if auth.is_none() {
+                let _ = tx.send(ChatMsg::control("own_failed", "", ""));
+                if tx.send(ChatMsg::system("This chat was opened before you signed in, so it's read-only. Reopen the channel to chat.")).is_err() {
+                    return Ok(());
+                }
+                continue;
+            }
             if let Some((user, _)) = auth {
                 let tag = reply_to.as_deref().map(|id| format!("@reply-parent-msg-id={id} ")).unwrap_or_default();
-                ws.send(Message::Text(format!("{tag}PRIVMSG #{login} :{text}").into())).map_err(|e| e.to_string())?;
-                let own = ChatMsg { login: user.clone(), name: user.clone(), color: "#2dd4bf".to_string(), spans: vec![Span::Text(text)], ..Default::default() };
+                ws.send(Message::Text(format!("{tag}PRIVMSG #{login} :{text}"))).map_err(|e| e.to_string())?;
+                room.sent_at = Some(std::time::Instant::now());
+                // Twitch doesn't echo your own messages; show it with the badges/color it reported (USERSTATE)
+                let name = if room.me_name.is_empty() { user.clone() } else { room.me_name.clone() };
+                let color = if room.me_color.is_empty() { "#2dd4bf".to_string() } else { room.me_color.clone() };
+                let own = ChatMsg {
+                    login: user.clone(),
+                    name,
+                    color,
+                    badges: room.me_badges.clone(),
+                    spans: vec![Span::Text(text)],
+                    target: "self".into(),
+                    ..Default::default()
+                };
                 if tx.send(own).is_err() {
                     return Ok(());
                 }
@@ -584,18 +754,16 @@ fn run_chat(
             Err(e) => return Err(e.to_string()),
         };
         let Message::Text(t) = msg else { continue };
-        let mut any = false;
         for line in t.as_str().split("\r\n").filter(|l| !l.is_empty()) {
             if line.starts_with("PING") {
-                ws.send(Message::Text(line.replacen("PING", "PONG", 1).into())).map_err(|e| e.to_string())?;
-            } else if let Some(m) = parse_irc(line) {
+                ws.send(Message::Text(line.replacen("PING", "PONG", 1))).map_err(|e| e.to_string())?;
+                continue;
+            }
+            for m in parse_irc(line, &mut room) {
                 if tx.send(m).is_err() {
                     return Ok(());
                 }
-                any = true;
             }
-        }
-        if any {
         }
     }
 }
@@ -604,18 +772,46 @@ fn unescape(v: &str) -> String {
     v.replace("\\s", " ").replace("\\:", ";").replace("\\\\", "\\")
 }
 
-fn parse_irc(line: &str) -> Option<ChatMsg> {
+fn fmt_secs(s: u64) -> String {
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86400),
+    }
+}
+
+/// One room mode as a sentence, or None when it is off.
+fn mode_text(key: &str, val: &str) -> Option<String> {
+    let n: i64 = val.parse().unwrap_or(0);
+    match key {
+        "slow" if n > 0 => Some(format!("Slow mode ({})", fmt_secs(n as u64))),
+        "followers-only" if n == 0 => Some("Followers-only mode".into()),
+        "followers-only" if n > 0 => Some(format!("Followers-only mode ({} following)", fmt_secs(n as u64 * 60))),
+        "subs-only" if n == 1 => Some("Subscribers-only mode".into()),
+        "emote-only" if n == 1 => Some("Emote-only mode".into()),
+        "r9k" if n == 1 => Some("Unique-chat mode".into()),
+        _ => None,
+    }
+}
+
+fn parse_irc(line: &str, room: &mut Room) -> Vec<ChatMsg> {
     let (tags, rest) = match line.strip_prefix('@') {
-        Some(l) => l.split_once(' ')?,
+        Some(l) => match l.split_once(' ') {
+            Some(x) => x,
+            None => return vec![],
+        },
         None => ("", line),
     };
     let tag = |k: &str| tags.split(';').find_map(|kv| kv.strip_prefix(k).and_then(|v| v.strip_prefix('=')));
-    let rest = rest.strip_prefix(':')?;
-    let (prefix, rest) = rest.split_once(' ')?;
+    let Some(rest) = rest.strip_prefix(':') else { return vec![] };
+    let Some((prefix, rest)) = rest.split_once(' ') else { return vec![] };
     let (cmd, rest) = rest.split_once(' ').unwrap_or((rest, ""));
+    let trailing = rest.split_once(" :").map(|(_, t)| t);
+    let badges = || tag("badges").unwrap_or("").split(',').filter(|b| !b.is_empty()).map(String::from).collect::<Vec<_>>();
     match cmd {
         "PRIVMSG" => {
-            let (_, mut text) = rest.split_once(" :")?;
+            let Some(mut text) = trailing else { return vec![] };
             if let Some(a) = text.strip_prefix("\u{1}ACTION ") {
                 text = a.trim_end_matches('\u{1}');
             }
@@ -626,30 +822,75 @@ fn parse_irc(line: &str) -> Option<ChatMsg> {
                 text: unescape(tag("reply-parent-msg-body").unwrap_or("")),
             });
             // Replies start with "@parent " in the text; emote positions still count those characters.
-            Some(ChatMsg {
+            vec![ChatMsg {
                 id: tag("id").unwrap_or("").to_string(),
                 login: nick.to_string(),
                 color: name_color(tag("color"), &name),
                 name,
                 spans: emote_spans(text, tag("emotes").unwrap_or("")),
-                system: false,
-                badges: tag("badges").unwrap_or("").split(',').filter(|b| !b.is_empty()).map(String::from).collect(),
+                badges: badges(),
                 reply,
-            })
+                ..Default::default()
+            }]
         }
         "NOTICE" => {
-            let (_, text) = rest.split_once(" :")?;
-            Some(ChatMsg::system(text.to_string()))
+            let Some(text) = trailing else { return vec![] };
+            let mut out = Vec::new();
+            // a refusal right after you sent something: your message didn't go through
+            let refused = tag("msg-id").is_some_and(|id| id.starts_with("msg_"));
+            if refused && room.sent_at.is_some_and(|t| t.elapsed() < Duration::from_secs(4)) {
+                room.sent_at = None;
+                out.push(ChatMsg::control("own_failed", "", ""));
+            }
+            out.push(ChatMsg::system(text.to_string()));
+            out
         }
         "USERNOTICE" => {
-            let sys = unescape(tag("system-msg")?);
-            let extra = rest.split_once(" :").map(|(_, t)| format!(" — {t}")).unwrap_or_default();
-            Some(ChatMsg::system(format!("★ {sys}{extra}")))
+            let Some(sys) = tag("system-msg") else { return vec![] };
+            let extra = trailing.map(|t| format!(" — {t}")).unwrap_or_default();
+            vec![ChatMsg::system(format!("★ {}{extra}", unescape(sys)))]
         }
-        _ => None,
+        "CLEARMSG" => tag("target-msg-id").map(|id| vec![ChatMsg::control("delete", id, "")]).unwrap_or_default(),
+        "CLEARCHAT" => match trailing {
+            Some(user) => {
+                let what = match tag("ban-duration").and_then(|d| d.parse::<u64>().ok()) {
+                    Some(s) => format!("{user} was timed out for {}", fmt_secs(s)),
+                    None => format!("{user} was banned"),
+                };
+                vec![ChatMsg::control("clear_user", user.to_lowercase(), what)]
+            }
+            None => vec![ChatMsg::control("clear_all", "", "Chat was cleared by a moderator")],
+        },
+        "USERSTATE" | "GLOBALUSERSTATE" => {
+            if let Some(n) = tag("display-name").filter(|s| !s.is_empty()) {
+                room.me_name = unescape(n);
+            }
+            room.me_color = name_color(tag("color"), &room.me_name);
+            room.me_badges = badges();
+            vec![]
+        }
+        "ROOMSTATE" => {
+            let mut changes = Vec::new();
+            for key in ["slow", "followers-only", "subs-only", "emote-only", "r9k"] {
+                let Some(val) = tag(key) else { continue };
+                let old = room.modes.insert(key.to_string(), val.to_string());
+                if old.as_deref() == Some(val) {
+                    continue;
+                }
+                match (mode_text(key, val), room.modes_known) {
+                    (Some(t), _) => changes.push(format!("{t} is on")),
+                    (None, true) if old.as_deref().and_then(|o| mode_text(key, o)).is_some() => {
+                        changes.push(format!("{} is off", mode_text(key, old.as_deref().unwrap_or("")).unwrap_or_default()))
+                    }
+                    _ => {}
+                }
+            }
+            room.modes_known = true;
+            changes.into_iter().map(ChatMsg::system).collect()
+        }
+        _ => vec![],
     }
 }
-
 fn emote_spans(text: &str, emotes: &str) -> Vec<Span> {
     let mut ranges: Vec<(usize, usize, &str)> = Vec::new();
     for e in emotes.split('/').filter(|s| !s.is_empty()) {

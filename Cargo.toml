@@ -1,6 +1,6 @@
 [package]
 name = "duostream"
-version = "0.6.0"
+version = "1.0.0"
 edition = "2021"
 description = "Twitch + Kick desktop client (Tauri 2)"
 repository = "https://github.com/0neBeerLeft/duostream"
@@ -10,15 +10,22 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
+# already in the tree via tauri/wry; used to put the hidden (tray) webview into low-memory mode
+webview2-com = "0.39"
+windows-core = "0.62"
+# DPAPI: sign-ins are stored encrypted for the current Windows user
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+# one running copy; a second launch focuses it (and hands over `twitch:name` args)
+tauri-plugin-single-instance = "2"
 tauri-plugin-notification = "2"
+# go-live toasts that open the stream when clicked (already in the tree via the notification plugin)
+tauri-winrt-notification = "0.8"
 tauri-plugin-updater = "2"
 ureq = { version = "2.10", features = ["json", "native-tls"] }
 native-tls = { version = "0.2", features = ["alpn"] }
 tungstenite = { version = "0.24", features = ["native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-base64 = "0.22"
 rand = "0.8"
 
 [profile.release]

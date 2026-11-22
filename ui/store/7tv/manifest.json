@@ -1,0 +1,8 @@
+{
+  "id": "7tv",
+  "name": "7TV Emotes",
+  "version": "1.0.0",
+  "author": "duostream",
+  "description": "Shows 7TV emotes in Twitch and Kick chat and in the emote picker.",
+  "builtin": true
+}
