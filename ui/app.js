@@ -1438,7 +1438,9 @@ function setPlayerState(kind) {
   if (kind === "playing") { p.classList.add("hidden"); return; }
   p.classList.remove("hidden");
   if (kind === "buffering" || kind === "loading") p.innerHTML = '<div class="spinner"></div>';
-  else if (kind === "offline") p.innerHTML = `${avatar(S.ch.platform, i.avatar, i.display, "xl")}<h3>${esc(i.display)} is offline</h3><p>Chat is still open.</p>`;
+  else if (kind === "offline") p.innerHTML = document.documentElement.classList.contains("browser-preview")
+    ? `<h3>Browser preview</h3><p>Live playback and chat are available in the desktop app. This channel is sample data.</p>`
+    : `${avatar(S.ch.platform, i.avatar, i.display, "xl")}<h3>${esc(i.display)} is offline</h3><p>Chat is still open.</p>`;
   else if (kind === "error") p.innerHTML = `<h3>Playback stopped</h3><p>${esc(S.ch.error || "Something went wrong.")}</p><button class="btn secondary" id="retryBtn" style="margin-top:8px">Retry</button>`;
   else if (kind === "pip") {
     p.innerHTML = `<div class="pip-note">${I.pip}</div><h3>Playing in picture-in-picture</h3><p>The stream is in its floating window. Chat stays here.</p><button class="btn secondary" id="pipBackBtn" style="margin-top:8px">Bring it back</button>`;
