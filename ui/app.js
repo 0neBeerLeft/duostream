@@ -1553,7 +1553,7 @@ function renderChannelInfo() {
     <div class="channel-identity">
       ${avatar(platform, info.avatar, info.display, "xl", info.live)}
       <div class="who">
-        <div class="uname">${esc(info.display)} ${info.live ? '<span class="live-pill">LIVE</span>' : S.ch.loading ? "" : '<span class="offline-tag">OFFLINE</span>'}</div>
+        <div class="uname">${esc(info.display)} ${info.live ? "" : S.ch.loading ? "" : '<span class="offline-tag">OFFLINE</span>'}</div>
         <div class="stitle" title="${esc(info.title)}">${esc(info.title || (S.ch.loading ? "Loading…" : ""))}</div>
         <div class="tags">${info.category ? `<span class="tag cat">${esc(info.category)}</span>` : ""}${ptag(platform)}</div>
       </div>
