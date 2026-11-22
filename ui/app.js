@@ -1550,17 +1550,19 @@ function renderChannelInfo() {
   const { platform, login, info } = S.ch;
   const followed = isFollowed(platform, login);
   box.innerHTML = `
-    ${avatar(platform, info.avatar, info.display, "xl", info.live)}
-    <div class="who">
-      <div class="uname">${esc(info.display)} ${info.live ? '<span class="live-pill">LIVE</span>' : S.ch.loading ? "" : '<span class="offline-tag">OFFLINE</span>'}</div>
-      <div class="stitle" title="${esc(info.title)}">${esc(info.title || (S.ch.loading ? "Loading…" : ""))}</div>
-      <div class="tags">${info.category ? `<span class="tag cat">${esc(info.category)}</span>` : ""}${ptag(platform)}</div>
+    <div class="channel-identity">
+      ${avatar(platform, info.avatar, info.display, "xl", info.live)}
+      <div class="who">
+        <div class="uname">${esc(info.display)} ${info.live ? '<span class="live-pill">LIVE</span>' : S.ch.loading ? "" : '<span class="offline-tag">OFFLINE</span>'}</div>
+        <div class="stitle" title="${esc(info.title)}">${esc(info.title || (S.ch.loading ? "Loading…" : ""))}</div>
+        <div class="tags">${info.category ? `<span class="tag cat">${esc(info.category)}</span>` : ""}${ptag(platform)}</div>
+      </div>
     </div>
     <div class="actions">
+      ${info.live ? `<div class="stats"><span class="v">${I.user}<span data-n="${info.viewers || 0}" data-k="c:${akey(platform, login)}" data-full>${(info.viewers || 0).toLocaleString()}</span><small>watching</small></span><span class="uptime-stat"><small>UPTIME</small><span id="uptime">${upClock(info.started)}</span></span></div>` : ""}
       <div class="row">
         <button class="follow-btn ${followed ? "on" : ""}" id="followBtn"><span class="fh">${I.heartFill}<i class="burst"></i></span><span class="fl"><span class="f-a">${followed ? "Following" : "Follow"}</span>${followed ? '<span class="f-b">Unfollow</span>' : ""}</span></button>
       </div>
-      ${info.live ? `<div class="stats"><span class="v">${I.user}<span data-n="${info.viewers || 0}" data-k="c:${akey(platform, login)}" data-full>${(info.viewers || 0).toLocaleString()}</span></span><span id="uptime">${upClock(info.started)}</span></div>` : ""}
     </div>`;
   animateCounts(box);
   $("#followBtn").onclick = () => toggleFollow(platform, login);
